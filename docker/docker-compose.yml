@@ -1,0 +1,33 @@
+version: '3.8'
+
+services:
+  lidar_scan_match:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: lidar_scan_match_c:latest
+    container_name: lidar_scan_match_c
+    stdin_open: true
+    tty: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      # 掛載 X11：處理顯示介面
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - "$HOME/.Xauthority:/root/.Xauthority:rw"
+      # 掛載源碼：使用相對路徑，讓不同機器都能運作
+      - ..:/root/catkin_ws/src/lidar_scan_match_c
+      # 使用環境變數掛載外部依賴與資料，若未設定則留空或使用預設值
+      - ${HDMAP_PATH:-/tmp}:/root/catkin_ws/src/hdmap_regenerate
+      - ${DATA_PATH:-/tmp}:/root/data
+    network_mode: "host"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia # 對應 --runtime=nvidia 與 --gpus all
+              count: all
+              capabilities: [ gpu, utility, compute, graphics, display ]

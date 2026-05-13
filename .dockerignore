@@ -1,0 +1,20 @@
+# Ignore Git
+.git
+.gitignore
+
+# Ignore build artifacts
+build/
+devel/
+install/
+output/
+tmp/
+
+# Ignore large data files
+*.pcap
+*.pcd
+*.bag
+data/
+
+# Ignore Docker related
+docker/*.sh
+.env
