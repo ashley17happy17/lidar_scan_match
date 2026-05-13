@@ -1,0 +1,7 @@
+build/
+output/
+tmp/
+TODO.md
+.env
+.DS_Store
+*.swp
