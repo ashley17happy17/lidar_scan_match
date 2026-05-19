@@ -37,8 +37,8 @@ FrontEndICP::FrontEndICP(ros::NodeHandle &nh) {
   nh.param<double>("icp_max_dist_sq", max_dist_sq, 9.0);
   nh.param<int>("icp_num_threads", num_threads, 10);
 
-  // Set to Standard ICP (Point-to-Point)
-  gicp_settings_.type = small_gicp::RegistrationSetting::ICP;
+  // Set to GICP (Generalized ICP) - much more robust than standard ICP
+  gicp_settings_.type = small_gicp::RegistrationSetting::GICP;
 
   gicp_settings_.max_correspondence_distance = std::sqrt(max_dist_sq);
 
@@ -83,6 +83,10 @@ void FrontEndICP::updateHDMapCloud(const PointCloudType::Ptr &cloud) {
   auto gicp_tree =
       std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(gicp_cloud);
 
+  // Precompute covariances for GICP
+  small_gicp::estimate_covariances_omp(*gicp_cloud, *gicp_tree, 20,
+                                       gicp_settings_.num_threads);
+
   // 2. Only lock for the pointer assignment
   {
     std::lock_guard<std::mutex> lock(hd_map_mutex_);
@@ -104,24 +108,29 @@ bool FrontEndICP::scanMatch(const PointCloudType::Ptr &source_cloud,
   auto source_gicp = toGicpCloud(source_cloud);
 
   small_gicp::KdTree<small_gicp::PointCloud> target_tree(target_gicp);
-
-  Eigen::Isometry3d init_guess(out_transform.cast<double>());
-  auto t0 = std::chrono::steady_clock::now();
+  small_gicp::KdTree<small_gicp::PointCloud> source_tree(source_gicp);
 
   auto current_settings = gicp_settings_;
   if (is_turning) {
-    // 轉彎時，反而應該「縮小」搜尋範圍。
-    // 如果範圍太大(例如 +10)，ICP
-    // 會去抓取遠處相似但錯誤的牆面(走廊效應)，導致側向嚴重漂移！
-    // 這裡我們將轉彎時的搜尋範圍強制縮小到 2.0
-    // 公尺，強迫它只匹配極度確定的局部特徵， 其餘的滑動直接交給 IMU
-    // 的預測來維持軌跡。
-    current_settings.max_correspondence_distance = 2.0;
+    // 轉彎時加大搜尋範圍 (原本是 2.0m 太小)，允許 ICP
+    // 在旋轉預測稍有偏差時仍能抓到特徵
+    current_settings.max_correspondence_distance = 15.0;
+    current_settings.max_iterations =
+        gicp_settings_.max_iterations * 2; // 增加迭代次數
   }
+
+  // Estimate covariances for both (Requirement for GICP)
+  small_gicp::estimate_covariances_omp(*target_gicp, target_tree, 20,
+                                       current_settings.num_threads);
+  small_gicp::estimate_covariances_omp(*source_gicp, source_tree, 20,
+                                       current_settings.num_threads);
+
+  Eigen::Isometry3d init_guess(out_transform.cast<double>());
+  auto t0 = std::chrono::steady_clock::now();
   ROS_INFO_THROTTLE(1.0, "[Detect Distance] Max Distance: %.2f.",
                     current_settings.max_correspondence_distance);
 
-  // 使用 Standard ICP 進行對齊，速度最快且最穩
+  // 使用 GICP 進行對齊，考慮表面幾何，精度與魯棒性更高
   auto result = small_gicp::align(*target_gicp, *source_gicp, target_tree,
                                   init_guess, current_settings);
 
@@ -206,8 +215,19 @@ bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
   }
   auto t1 = std::chrono::steady_clock::now();
 
+  auto current_settings = gicp_settings_;
+  if (is_turning) {
+    // 全域地圖匹配同樣加大範圍與迭代次數
+    current_settings.max_correspondence_distance = 15.0;
+    current_settings.max_iterations = gicp_settings_.max_iterations * 2;
+  }
+
   // 2. Source Cloud Conversion
   auto source_gicp = toGicpCloud(current_cloud);
+  auto source_tree =
+      std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(source_gicp);
+  small_gicp::estimate_covariances_omp(*source_gicp, *source_tree, 20,
+                                       current_settings.num_threads);
   auto t2 = std::chrono::steady_clock::now();
 
   /*
@@ -251,11 +271,6 @@ bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
 
   // Pass the prebuilt target KdTree to GICP alignment
   Eigen::Isometry3d init_guess(out_transform.cast<double>());
-  auto current_settings = gicp_settings_;
-  if (is_turning) {
-    // 同樣地，對全域地圖匹配時，轉彎期間也應該縮小範圍，避免匹配到對向車道或錯誤的相似結構
-    current_settings.max_correspondence_distance = 4.0;
-  }
   auto result = small_gicp::align(*target_gicp, *source_gicp, *target_tree,
                                   init_guess, current_settings);
   auto t3 = std::chrono::steady_clock::now();
@@ -308,6 +323,11 @@ void FrontEndICP::addKeyframeCloud(const PointCloudType::Ptr &cloud,
   keyframe_poses_.push_back(pose);
 }
 
+void FrontEndICP::clearLocalMap() {
+  keyframe_clouds_.clear();
+  keyframe_poses_.clear();
+}
+
 void FrontEndICP::shiftLocalMap(const Eigen::Matrix4f &delta_transform) {
   for (auto &pose : keyframe_poses_) {
     pose = delta_transform * pose;
@@ -320,8 +340,8 @@ void FrontEndICP::getLocalMap(PointCloudType::Ptr &out_local_map) {
   if (num_keyframes == 0)
     return;
 
-  // Use a sliding window of the last 5 keyframes to build a FAST local map
-  int window_size = 10;
+  // Use a sliding window to build a FAST local map
+  int window_size = 30;
   int start_idx = std::max(0, num_keyframes - window_size);
 
   for (int i = start_idx; i < num_keyframes; ++i) {

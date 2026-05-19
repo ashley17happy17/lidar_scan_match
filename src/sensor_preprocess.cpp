@@ -6,6 +6,7 @@ SensorPreprocess::SensorPreprocess(ros::NodeHandle &nh) {
   nh.param<double>("leaf_size", leaf_size_, 0.2);
   nh.param<double>("crop_vehicle_x", crop_vehicle_x_, 2.0);
   nh.param<double>("crop_vehicle_y", crop_vehicle_y_, 1.0);
+  nh.param<double>("crop_vehicle_z", crop_vehicle_z_, -1.5);
   downSizeFilter_.setLeafSize(leaf_size_, leaf_size_, leaf_size_);
 }
 
@@ -23,12 +24,15 @@ void SensorPreprocess::processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
 
 void SensorPreprocess::denoiseCloud(const PointCloudType::Ptr &in_cloud,
                                     PointCloudType::Ptr &out_cloud) {
-  // Crop points around the vehicle to avoid matching dynamic objects (e.g. ego body, adjacent cars)
+  // Crop points around the vehicle to avoid matching dynamic objects (e.g. ego
+  // body, adjacent cars) but keep the ground points (where p.z <=
+  // crop_vehicle_z_)
   PointCloudType::Ptr cropped_cloud(new PointCloudType());
   cropped_cloud->points.reserve(in_cloud->size());
-  
-  for (const auto& p : in_cloud->points) {
-    if (std::abs(p.x) < crop_vehicle_x_ && std::abs(p.y) < crop_vehicle_y_) {
+
+  for (const auto &p : in_cloud->points) {
+    if (std::abs(p.x) < crop_vehicle_x_ && std::abs(p.y) < crop_vehicle_y_ &&
+        p.z > crop_vehicle_z_) {
       continue;
     }
     cropped_cloud->points.push_back(p);

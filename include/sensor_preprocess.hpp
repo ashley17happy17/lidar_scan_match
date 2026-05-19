@@ -25,6 +25,7 @@ private:
   double leaf_size_;
   double crop_vehicle_x_;
   double crop_vehicle_y_;
+  double crop_vehicle_z_;
   pcl::VoxelGrid<PointType> downSizeFilter_;
 };
 

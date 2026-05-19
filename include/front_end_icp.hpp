@@ -37,6 +37,7 @@ public:
                         const Eigen::Matrix4f &pose);
   void getLocalMap(PointCloudType::Ptr &out_local_map);
   void shiftLocalMap(const Eigen::Matrix4f &delta_transform);
+  void clearLocalMap();
   bool hasKeyframes() const { return !keyframe_clouds_.empty(); }
   int getKeyframeCount() const { return keyframe_clouds_.size(); }
   bool detectLoopClosure(const Eigen::Matrix4f &current_pose,

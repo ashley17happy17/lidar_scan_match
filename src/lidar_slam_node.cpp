@@ -7,6 +7,7 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <std_msgs/Float32.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <visualization_msgs/MarkerArray.h>
 
 #include "back_end_optimization.hpp"
 #include "front_end_icp.hpp"
@@ -41,7 +42,10 @@ public:
     nh_.param<std::string>("gps_topic", gps_topic, "/gps/fix");
     nh_.param<std::string>("imu_topic", imu_topic, "/imu/data");
     nh_.param<int>("lidar_rps", lidar_rps_, 10);
-    nh_.param<int>("hd_map_match_interval", hd_map_match_interval_, 5);
+    int hd_map_match_freq;
+    nh_.param<int>("hd_map_match_interval", hd_map_match_freq, 5);
+    // 計算跳幀間隔：例如 10Hz / 5Hz = 每 2 幀匹配一次
+    hd_map_match_interval_ = std::max(1, lidar_rps_ / hd_map_match_freq);
     nh_.param<double>("gps_std_thres", gps_std_thres_, 0.3);
     nh_.param<double>("gps_cov_multiplier", gps_cov_multiplier_, 1.0);
     nh_.param<std::string>(
@@ -56,6 +60,9 @@ public:
                       15.0);
     nh_.param<double>("loop_closure_fitness_score", loop_closure_fitness_score_,
                       0.3);
+
+    nh_.param<double>("max_single_frame_translation", max_trans_jump_, 1.5);
+    nh_.param<double>("max_single_frame_rotation", max_rot_jump_, 0.5);
 
     last_reg_time_ = -1.0;
     last_record_time_ = -1.0;
@@ -80,6 +87,8 @@ public:
         "/lidar_scan_match_c/fitness_score", 1);
     pub_gps_path_ =
         nh_.advertise<nav_msgs::Path>("/lidar_scan_match_c/gps_path", 10);
+    pub_range_rings_ = nh_.advertise<visualization_msgs::MarkerArray>(
+        "/lidar_scan_match_c/range_rings", 1);
 
     global_path_.header.frame_id = "map";
     gps_path_.header.frame_id = "map";
@@ -137,6 +146,18 @@ private:
   void gpsCallback(const sensor_msgs::NavSatFixConstPtr &msg) {
     if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX)
       return;
+
+    if (!gps_translator_internal_.initialized) {
+      gps_translator_internal_.Reset(msg->latitude, msg->longitude,
+                                     msg->altitude);
+      gps_translator_internal_.GetTWD97(
+          msg->latitude, msg->longitude, msg->altitude, map_origin_twd97_.x(),
+          map_origin_twd97_.y(), map_origin_twd97_.z());
+      has_map_origin_ = true;
+      ROS_INFO("[Init] GPS Map origin established: Lat: %.6f, Lon: %.6f",
+               msg->latitude, msg->longitude);
+    }
+
     std::lock_guard<std::mutex> lock(gps_buf_mutex_);
     gps_buf_.push(msg);
   }
@@ -151,12 +172,15 @@ private:
     double offset_x, offset_y, offset_z;
   };
   std::vector<MapTileInfo> available_map_tiles_;
+  std::atomic<bool> first_map_check_done_{false};
 
   void mapLoaderLoop() {
     std::string hd_map_dir;
     if (!nh_.getParam("hd_map_directory", hd_map_dir) ||
-        !nh_.getParam("map_tile_size", tile_size))
+        !nh_.getParam("map_tile_size", tile_size)) {
+      first_map_check_done_ = true;
       return;
+    }
 
     ros::Rate rate(1);
     Eigen::Vector3f last_checked_pos(-999999.0f, -999999.0f, -999999.0f);
@@ -179,21 +203,32 @@ private:
 
         PointCloudType::Ptr merged_tiles(new PointCloudType());
         if (available_map_tiles_.empty()) {
-          for (const auto &entry :
-               std::filesystem::directory_iterator(hd_map_dir)) {
-            if (entry.path().extension() == ".pcd") {
-              double ox, oy, oz;
-              if (sscanf(entry.path().filename().string().c_str(),
-                         "map_%lf_%lf_%lf.pcd", &ox, &oy, &oz) == 3) {
-                available_map_tiles_.push_back(
-                    {entry.path().string(), ox, oy, oz});
+          try {
+            if (std::filesystem::exists(hd_map_dir) &&
+                std::filesystem::is_directory(hd_map_dir)) {
+              for (const auto &entry :
+                   std::filesystem::directory_iterator(hd_map_dir)) {
+                if (entry.path().extension() == ".pcd") {
+                  double ox, oy, oz;
+                  if (sscanf(entry.path().filename().string().c_str(),
+                             "map_%lf_%lf_%lf.pcd", &ox, &oy, &oz) == 3) {
+                    available_map_tiles_.push_back(
+                        {entry.path().string(), ox, oy, oz});
+                  }
+                }
               }
+              std::sort(available_map_tiles_.begin(),
+                        available_map_tiles_.end(),
+                        [](const MapTileInfo &a, const MapTileInfo &b) {
+                          return a.offset_x < b.offset_x;
+                        });
+            } else {
+              ROS_WARN("[MapLoader] HD map directory does not exist: %s",
+                       hd_map_dir.c_str());
             }
+          } catch (const std::exception &e) {
+            ROS_ERROR("[MapLoader] Error reading map directory: %s", e.what());
           }
-          std::sort(available_map_tiles_.begin(), available_map_tiles_.end(),
-                    [](const MapTileInfo &a, const MapTileInfo &b) {
-                      return a.offset_x < b.offset_x;
-                    });
         }
 
         for (const auto &tile_info : available_map_tiles_) {
@@ -214,6 +249,10 @@ private:
             }
           }
         }
+
+        first_map_check_done_ = true;
+        last_checked_pos = current_pos;
+
         if (!merged_tiles->empty()) {
           // Optimized for real-time: Downsample the HD map to 0.5m density
           PointCloudType::Ptr optimized_map(new PointCloudType());
@@ -267,13 +306,30 @@ private:
     while (ros::ok()) {
       sensor_msgs::PointCloud2ConstPtr lidar_msg = nullptr;
       size_t buf_size = 0;
+      bool wait_for_lidar = false;
+      bool wait_for_map = false;
+
       {
         std::lock_guard<std::mutex> lock(lidar_buf_mutex_);
-        buf_size = lidar_buf_.size();
-        if (!lidar_buf_.empty()) {
+        if (lidar_buf_.empty()) {
+          wait_for_lidar = true;
+        } else if (!first_map_check_done_) {
+          wait_for_map = true;
+        } else {
+          buf_size = lidar_buf_.size();
           lidar_msg = lidar_buf_.front();
           lidar_buf_.pop();
         }
+      }
+
+      if (wait_for_lidar) {
+        rate.sleep();
+        continue;
+      }
+      if (wait_for_map) {
+        ROS_INFO_THROTTLE(1.0, "[Init] Waiting for initial HD Map check...");
+        rate.sleep();
+        continue;
       }
 
       if (!lidar_msg) {
@@ -306,7 +362,6 @@ private:
             double yaw_imu = atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
                                    1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
             // Align North-Up IMU (0) to ENU Y-axis (90)
-            // double yaw_enu = yaw_imu + (M_PI / 2.0);
             double yaw_enu = -yaw_imu + (M_PI / 2.0);
 
             Eigen::Matrix4f T_world = Eigen::Matrix4f::Identity();
@@ -351,16 +406,17 @@ private:
           gps_buf_.pop();
         }
       }
+
+      static bool currently_within_hd_bounds = false;
+      static int consecutive_hd_map_failures = 0;
+      static double current_gps_speed = 0.0; // Global to processLoop for ZUPT
+      static double last_gps_time_for_speed = -1.0;
+      static Eigen::Vector2d last_gps_pos_2d(0, 0);
+      static double gps_displacement =
+          0.0; // Added for precise ZUPT displacement tracking
+      static int static_frame_count = 0; // Global to processLoop for ZUPT
+
       for (const auto &gps : gps_msgs) {
-        if (!gps_translator_internal_.initialized) {
-          gps_translator_internal_.Reset(gps->latitude, gps->longitude,
-                                         gps->altitude);
-          gps_translator_internal_.GetTWD97(
-              gps->latitude, gps->longitude, gps->altitude,
-              map_origin_twd97_.x(), map_origin_twd97_.y(),
-              map_origin_twd97_.z());
-          has_map_origin_ = true;
-        }
         if (gps_translator_internal_.initialized) {
           double tx, ty, tz;
           gps_translator_internal_.GetTWD97(gps->latitude, gps->longitude,
@@ -370,6 +426,18 @@ private:
           gm.latitude = tx - map_origin_twd97_.x();
           gm.longitude = ty - map_origin_twd97_.y();
           gm.altitude = tz - map_origin_twd97_.z();
+
+          Eigen::Vector2d curr_gps_pos_2d(gm.latitude, gm.longitude);
+          if (last_gps_time_for_speed > 0) {
+            double dt = gm.timestamp - last_gps_time_for_speed;
+            if (dt > 0.05) { // 避免時間差過小導致除以零或雜訊放大
+              current_gps_speed =
+                  (curr_gps_pos_2d - last_gps_pos_2d).norm() / dt;
+              gps_displacement = (curr_gps_pos_2d - last_gps_pos_2d).norm();
+            }
+          }
+          last_gps_pos_2d = curr_gps_pos_2d;
+          last_gps_time_for_speed = gm.timestamp;
 
           // 讀取 GPS 雜訊 (Covariance)
           double cov_x =
@@ -389,13 +457,37 @@ private:
           if (has_cov && cov_h < gps_std_thres_) {
             // 將高精度的變異數真實反映給 GTSAM，並乘上人工權重係數 (Covariance
             // 越大代表越不信任)
-            gm.covariance_diag << cov_x * gps_cov_multiplier_,
-                cov_y * gps_cov_multiplier_, cov_z * gps_cov_multiplier_;
-            backend_->addGpsFactor(gm);
-            ROS_INFO_THROTTLE(1.0,
-                              "[GPS] RTK High-Precision GPS injected! "
-                              "2DStdDev: %.2fm (Weight Multiplier: %.1f)",
-                              cov_h, gps_cov_multiplier_);
+            if (!currently_within_hd_bounds || !has_hd_map_matched_ ||
+                consecutive_hd_map_failures >= 3) {
+              gm.covariance_diag << cov_x * gps_cov_multiplier_,
+                  cov_y * gps_cov_multiplier_, cov_z * gps_cov_multiplier_;
+              backend_->addGpsFactor(gm);
+
+              if (currently_within_hd_bounds &&
+                  consecutive_hd_map_failures >= 3) {
+                ROS_WARN_THROTTLE(1.0, "[GPS] HD Map failed >= 3 times! "
+                                       "Fallback to RTK GNSS injected!");
+              } else if (!has_hd_map_matched_) {
+                ROS_INFO_THROTTLE(2.0,
+                                  "[GPS] Pre-Match: Trusting RTK GPS tightly "
+                                  "for initialization! "
+                                  "2DStdDev: %.2fm",
+                                  cov_h);
+              } else {
+                ROS_INFO_THROTTLE(1.0,
+                                  "[GPS] RTK High-Precision GPS injected! "
+                                  "2DStdDev: %.2fm (Weight Multiplier: %.1f)",
+                                  cov_h, gps_cov_multiplier_);
+              }
+            } else {
+              // IN HD MAP: Inject GNSS with a massive covariance (10.0m std dev
+              // -> 100.0 variance). This is too weak to cause lateral wobbling
+              // fighting the HD map, but it acts as a final longitudinal anchor
+              // to prevent infinite corridor sliding!
+              double loose_var = 100.0;
+              gm.covariance_diag << loose_var, loose_var, loose_var;
+              backend_->addGpsFactor(gm);
+            }
           } else {
             // 如果是一般 GPS (誤差數公尺)，則不丟入優化器，避免撕裂 HD Map
             // 的精準軌跡
@@ -427,200 +519,374 @@ private:
 
         if (run_matching) {
           last_reg_time_ = lidar_time;
-          // 0. Handle first frame initialization
-          if (!frontend_->hasKeyframes()) {
-            frontend_->addKeyframeCloud(cloud, current_pose);
-            backend_->addOdomFactor(lidar_time, current_pose, false, false);
-            backend_->optimize();
-            publishData(lidar_time, current_pose, cloud, local_map);
-            ROS_INFO("First Lidar frame initialized.");
-            continue;
-          }
+
+          bool is_first_lidar_frame = first_frame;
 
           // 1. Prediction from Backend (IMU integration)
-          if (!first_frame) {
-            Eigen::Matrix4f predicted_pose =
-                backend_->getPredictedPose().matrix().cast<float>();
-            double predict_jump = (predicted_pose.block<3, 1>(0, 3) -
-                                   current_pose.block<3, 1>(0, 3))
-                                      .norm();
-            if (predict_jump > 3.0) {
-              ROS_ERROR_THROTTLE(1.0,
-                                 "[FATAL] IMU Prediction Exploded! Jump: "
-                                 "%.2fm. Failsafe activated.",
-                                 predict_jump);
-              // Fallback: Use the previous valid pose (constant position
-              // fallback) to survive the frame without detonating ICP.
+          Eigen::Matrix4f predicted_pose = current_pose;
+          double predict_jump = 0.0;
+          double predict_angle = 0.0;
+
+          if (!is_first_lidar_frame) {
+            if (static_frame_count >= 3) {
+              // 如果車輛處於 ZUPT 靜止鎖定狀態，我們強制預測位姿為當前位姿，
+              // 徹底阻斷任何由 IMU 偏差積分產生的前後滑動與預測漂移！
+              predicted_pose = current_pose;
+              predict_jump = 0.0;
+              predict_angle = 0.0;
             } else {
-              current_pose = predicted_pose;
+              predicted_pose =
+                  backend_->getPredictedPose().matrix().cast<float>();
+              predict_jump = (predicted_pose.block<3, 1>(0, 3) -
+                              current_pose.block<3, 1>(0, 3))
+                                 .norm();
+              Eigen::Matrix3f R_curr = current_pose.block<3, 3>(0, 0);
+              Eigen::Matrix3f R_pred = predicted_pose.block<3, 3>(0, 0);
+              predict_angle = std::abs(
+                  Eigen::AngleAxisf(R_pred * R_curr.transpose()).angle());
             }
           } else {
             first_frame = false;
+            ROS_INFO("[Init] Processing first Lidar frame...");
           }
-          Eigen::Matrix4f local_pose = current_pose;
-          double fitness;
 
-          // --- Turn Detection ---
+          bool scan_match_failed = false;
+          bool hd_map_matched_this_frame = false;
           bool is_turning = false;
+          double fitness = 1e6;
+          double hd_fitness = 1e6;
+          Eigen::Matrix4f hd_pose = current_pose;
+          Eigen::Matrix4f delta_transform = Eigen::Matrix4f::Identity();
+          bool should_skip_frame = false;
+          currently_within_hd_bounds = false;
+          bool local_match_success = false;
+          bool use_temp_local_map = false;
+
+          // --- Update current_pose with prediction ---
+          if (predict_jump < max_trans_jump_ && predict_angle < max_rot_jump_) {
+            current_pose = predicted_pose;
+          } else if (!is_first_lidar_frame) {
+            ROS_WARN_THROTTLE(
+                2.0,
+                "[Prediction] Rejected IMU prediction due to large jump "
+                "(trans: %.2fm/%.2fm, rot: %.2frad/%.2frad)",
+                predict_jump, max_trans_jump_, predict_angle, max_rot_jump_);
+          }
+
+          Eigen::Matrix4f local_pose = current_pose;
+          // --- Turn Detection (YAW ONLY & Filtered to prevent false triggers)
+          // ---
           {
             static Eigen::Matrix4f prev_pose_for_turn =
                 Eigen::Matrix4f::Identity();
             static bool first_turn_check = true;
+            static int turn_frame_count = 0;
+
             if (first_turn_check) {
               prev_pose_for_turn = current_pose;
               first_turn_check = false;
             }
-            Eigen::Matrix3f R_curr = current_pose.block<3, 3>(0, 0);
-            Eigen::Matrix3f R_prev = prev_pose_for_turn.block<3, 3>(0, 0);
-            double turn_angle = std::abs(
-                Eigen::AngleAxisf(R_curr * R_prev.transpose()).angle());
 
-            // If turn_angle > 0.02 rad per frame (~11 deg/s at 10Hz), consider
-            // it as turning
-            ROS_INFO_THROTTLE(1.0, "[Turn Angle] %.2f.", turn_angle);
-            if (turn_angle > 0.02) {
+            Eigen::Vector3f fwd_prev =
+                prev_pose_for_turn.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
+            Eigen::Vector3f fwd_curr =
+                current_pose.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
+            fwd_prev.z() = 0;
+            fwd_curr.z() = 0; // Project to horizontal plane
+
+            if (fwd_prev.norm() > 1e-6 && fwd_curr.norm() > 1e-6) {
+              fwd_prev.normalize();
+              fwd_curr.normalize();
+              double turn_angle = std::acos(
+                  std::max(-1.0f, std::min(1.0f, fwd_prev.dot(fwd_curr))));
+
+              if (turn_angle > 0.015) { // 0.015 rad = ~0.85 deg/frame
+                turn_frame_count++;
+              } else {
+                turn_frame_count = 0;
+              }
+            }
+
+            if (turn_frame_count >=
+                2) { // Require 2 consecutive frames to trigger
               is_turning = true;
-              ROS_INFO_THROTTLE(1.0, "[Turn Detect] Turning detected! "
-                                     "Increasing ICP search range.");
             }
             prev_pose_for_turn = current_pose;
           }
 
-          bool scan_match_failed = false;
-          // 2. Step A: Scan-to-LocalMap Matching
-          frontend_->getLocalMap(local_map);
-          if (frontend_->scanMatch(cloud, local_map, local_pose, fitness,
-                                   is_turning)) {
-            double jump =
-                (local_pose.block<3, 1>(0, 3) - current_pose.block<3, 1>(0, 3))
-                    .norm();
-            if (jump < 3.0) {
-              current_pose = local_pose;
+          // --- Extended Local Map tracking (Keep for 20m after turn) ---
+          static bool was_turning_extended = false;
+          static Eigen::Vector3f turn_end_pos = Eigen::Vector3f::Zero();
+          use_temp_local_map = is_turning;
+
+          if (is_turning) {
+            was_turning_extended = true;
+            turn_end_pos = current_pose.block<3, 1>(0, 3);
+          } else if (was_turning_extended) {
+            double dist_since_turn =
+                (current_pose.block<3, 1>(0, 3) - turn_end_pos).norm();
+            if (dist_since_turn < 20.0) {
+              use_temp_local_map = true;
             } else {
-              ROS_WARN("[Match] Huge jump (%.2fm), ignoring scan-to-local "
-                       "result. Relying on IMU prediction.",
-                       jump);
-              scan_match_failed = true;
+              was_turning_extended = false;
+              ROS_INFO("[Local Map] 20 meters reached since turn ended. Ready "
+                       "to clear temporary local map.");
             }
-          } else {
-            ROS_WARN("[Match] Scan-to-Local failed. Failsafe activated: "
-                     "maintaining safe prediction.");
-            scan_match_failed = true;
           }
 
-          // 3. Step B: Scan-to-HDMap Refinement BEFORE adding Odom Factor
-          Eigen::Matrix4f hd_pose = current_pose;
-          double hd_fitness;
-          static int hd_match_count = 0;
-          bool hd_map_matched_this_frame = false;
-          Eigen::Matrix4f delta_transform = Eigen::Matrix4f::Identity();
-
-          bool has_hd_map = false;
+          // 2. 判斷是否在 HD Map 範圍內 (Overlap Check)
           pcl::KdTreeFLANN<PointType>::Ptr local_kdtree;
           {
             std::lock_guard<std::mutex> lock(hd_map_mutex_);
-            if (current_global_map_ != nullptr &&
-                !current_global_map_->empty() && hd_map_kdtree_ != nullptr) {
-              has_hd_map = true;
+            if (current_global_map_ && !current_global_map_->empty() &&
+                hd_map_kdtree_) {
               local_kdtree = hd_map_kdtree_;
-            }
-          }
-
-          if (has_hd_map) {
-            PointType posPoint;
-            posPoint.x = current_pose(0, 3);
-            posPoint.y = current_pose(1, 3);
-            posPoint.z = current_pose(2, 3);
-
-            // Predict a point 15 meters directly ahead of the vehicle
-            Eigen::Vector3f forward_dir =
-                current_pose.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
-            Eigen::Vector3f lookahead_pos =
-                current_pose.block<3, 1>(0, 3) + forward_dir * 15.0f;
-            PointType lookaheadPoint;
-            lookaheadPoint.x = lookahead_pos.x();
-            lookaheadPoint.y = lookahead_pos.y();
-            lookaheadPoint.z = lookahead_pos.z();
-
-            std::vector<int> pointIdx(1);
-            std::vector<float> pointDistSq(1);
-
-            // 1. Check if vehicle is physically near the map
-            if (local_kdtree->nearestKSearch(posPoint, 1, pointIdx,
-                                             pointDistSq) > 0) {
-              if (std::sqrt(pointDistSq[0]) >
-                  8.0) { // Car is > 8m away from the closest map point
-                has_hd_map = false;
-              }
-            }
-
-            // 2. Check if the map continues ahead (Lookahead boundary
-            // detection)
-            if (has_hd_map &&
-                local_kdtree->nearestKSearch(lookaheadPoint, 1, pointIdx,
-                                             pointDistSq) > 0) {
-              if (std::sqrt(pointDistSq[0]) >
-                  15.0) { // No map points within 15m of the lookahead position
-                has_hd_map = false;
-              }
-            }
-          }
-
-          if (has_hd_map) {
-            if (++hd_match_count >= (lidar_rps_ / hd_map_match_interval_)) {
-              hd_match_count = 0;
-              if (frontend_->scanToHDMapMatch(cloud, hd_pose, hd_fitness,
-                                              is_turning)) {
-                if (hd_fitness < frontend_->getICPThreshold().max_fitness) {
-                  // Compute the coordinate jump delta
-                  double hd_jump = (hd_pose.block<3, 1>(0, 3) -
-                                    current_pose.block<3, 1>(0, 3))
-                                       .norm();
-                  if (hd_jump > 3.0 * (lidar_rps_ / hd_map_match_interval_)) {
-                    ROS_ERROR("[HD Map] Hallucinated match detected! Jump was "
-                              "%.2fm. Discarding falsely good match.",
-                              hd_jump);
-                  } else {
-                    hd_map_matched_this_frame = true;
-                    has_hd_map_matched_ =
-                        true; // Global localization established
-                  }
+              PointType posPoint;
+              posPoint.x = current_pose(0, 3);
+              posPoint.y = current_pose(1, 3);
+              posPoint.z = current_pose(2, 3);
+              std::vector<int> pIdx(1);
+              std::vector<float> pDistSq(1);
+              if (local_kdtree->nearestKSearch(posPoint, 1, pIdx, pDistSq) >
+                  0) {
+                // "和hdmap重合的部份小於一定距離或範圍" - 超過 20m 視為沒有
+                // HD Map (Increased to 30.0m to handle maps without ground
+                // points)
+                if (std::sqrt(pDistSq[0]) < 30.0) {
+                  currently_within_hd_bounds = true;
                 }
               }
             }
+          }
+
+          static bool was_in_hd_map = false;
+
+          if (currently_within_hd_bounds) {
+            // --- 狀態 A：有 HD Map ---
+            // 預設進行 Scan-to-HDMap (信賴，糾正 GPS/IMU)
+            static int hd_match_count = 0;
+            bool periodic_update = (++hd_match_count >= hd_map_match_interval_);
+
+            // 確保在車輛即將靜止的前一兩幀，強制執行高精度的 HD Map 匹配，
+            // 這樣可以保證 ZUPT 凍結時，車輛是完美停在正確的 HD Map
+            // 位置上，而不是停在漂移的 IMU 預測位置。
+            if (static_frame_count > 0 && static_frame_count < 3) {
+              periodic_update = true;
+            }
+
+            if (!was_in_hd_map) {
+              periodic_update = true;
+              consecutive_hd_map_failures = 0;
+            }
+            was_in_hd_map = true;
+
+            // == 1. 全域匹配 (HD Map) ==
+            if (periodic_update) {
+              hd_match_count = 0;
+              Eigen::Matrix4f rescue_pose = current_pose;
+              if (frontend_->scanToHDMapMatch(cloud, rescue_pose, hd_fitness,
+                                              is_turning)) {
+                ROS_INFO_THROTTLE(1.0, "[DEBUG] hd_fitness: %.2f.", hd_fitness);
+
+                // 放寬轉彎時的接受標準，因為運動模糊可能會讓 fitness 稍微增加
+                double threshold = frontend_->getICPThreshold().max_fitness;
+                if (is_turning)
+                  threshold *= 5.0;
+
+                Eigen::Matrix3f R_pred = predicted_pose.block<3, 3>(0, 0);
+                Eigen::Vector3f delta_t_body =
+                    R_pred.transpose() * (rescue_pose.block<3, 1>(0, 3) -
+                                          predicted_pose.block<3, 1>(0, 3));
+                double lateral_jump = std::abs(delta_t_body.y());
+
+                if (hd_fitness < threshold && lateral_jump < 0.3) {
+                  current_pose = rescue_pose;
+                  hd_map_matched_this_frame = true;
+                  hd_pose = rescue_pose;
+                  has_hd_map_matched_ = true;
+                  consecutive_hd_map_failures = 0;
+                } else {
+                  consecutive_hd_map_failures++;
+                  if (hd_fitness < threshold && lateral_jump >= 0.3) {
+                    ROS_WARN_THROTTLE(1.0,
+                                      "[HD Map] Match rejected due to large "
+                                      "lateral jump: %.2fm >= 0.3m",
+                                      lateral_jump);
+                  }
+                }
+              } else {
+                consecutive_hd_map_failures++;
+              }
+            }
+
+            // == 2. 局部匹配與建圖 (Local Map) ==
+            // 使用者邏輯 3: "只有在轉彎以及過轉彎後20公尺
+            // 會依據點雲對地圖匹配好的結果 來製作LOCALMAP ，並且會進行SCANMATCH
+            // (LO)"
+            if (use_temp_local_map) {
+              if (has_last_keyframe_ && !local_map->empty()) {
+                if (!hd_map_matched_this_frame) {
+                  // 只有在這一幀「沒有嘗試 HD Map 匹配」時，才進行局部匹配 (LO)
+                  // 如果是嘗試了 HD Map 匹配但失敗，則不進行局部匹配且不更新
+                  // Local Map
+                  if (!periodic_update) {
+                    if (frontend_->scanMatch(cloud, local_map, local_pose,
+                                             fitness, true)) {
+                      double jump = (local_pose.block<3, 1>(0, 3) -
+                                     current_pose.block<3, 1>(0, 3))
+                                        .norm();
+                      if (jump < 1.0) {
+                        current_pose = local_pose;
+                        local_match_success = true;
+                      }
+                    }
+                  } else {
+                    ROS_WARN_THROTTLE(
+                        1.0, "[HD Map] Match failed this frame. Skipping local "
+                             "map update to prevent corruption.");
+                  }
+                } else {
+                  // HD Map
+                  // 匹配成功，直接沿用其高精度結果，並允許後續將此點雲加入
+                  // Local Map
+                  local_match_success = true;
+                }
+              } else {
+                // 初始化 Local Map
+                if (hd_map_matched_this_frame || !periodic_update) {
+                  frontend_->clearLocalMap();
+                  local_map->clear();
+                  local_match_success = true;
+                  has_last_keyframe_ = true;
+                  last_keyframe_pose_ = current_pose;
+                } else {
+                  ROS_WARN_THROTTLE(1.0, "[HD Map] Match failed on initial "
+                                         "frame. Cannot initialize Local Map.");
+                }
+              }
+            } else {
+              // 非轉彎/緩衝期，嚴格清空 Local Map (不該點雲匹配的時候絕不出現
+              // localmap)
+              if (has_last_keyframe_) {
+                frontend_->clearLocalMap();
+                local_map->clear();
+                has_last_keyframe_ = false;
+              }
+            }
+
+            should_skip_frame =
+                !hd_map_matched_this_frame && !local_match_success;
+
           } else {
-            ROS_INFO_THROTTLE(
-                2.0,
-                "[Odometry Only] No HD Map loaded. Running Lidar Odometry.");
+            // --- 狀態 B：沒有 HD Map ---
+            // "當沒有hdmap的時候 才會誘發scanmatch"
+            was_in_hd_map = false;
+
+            if (has_last_keyframe_ && !local_map->empty()) {
+              if (frontend_->scanMatch(cloud, local_map, local_pose, fitness,
+                                       is_turning)) {
+                double jump = (local_pose.block<3, 1>(0, 3) -
+                               current_pose.block<3, 1>(0, 3))
+                                  .norm();
+                double local_threshold =
+                    frontend_->getICPThreshold().max_fitness * 0.5;
+                if (is_turning) {
+                  local_threshold *= 1.5; // 轉彎時放寬至 1.5 倍
+                }
+                if (jump < 1.0) {
+                  current_pose =
+                      local_pose; // 永遠採信 Lidar Odometry 避免 IMU 預測失控
+                  if (fitness < local_threshold) {
+                    local_match_success = true;
+                  } else {
+                    ROS_WARN_THROTTLE(
+                        1.0,
+                        "[Local Map] High fitness %.2f > %.2f. Pose updated, "
+                        "but cloud NOT added to map.",
+                        fitness, local_threshold);
+                  }
+                } else {
+                  ROS_WARN_THROTTLE(
+                      1.0, "[Local Map] Rejected match: jump=%.2fm > 1.0m",
+                      jump);
+                }
+              }
+            } else {
+              // 剛離開 HD Map (或一開始就沒有)，強制信任 GPS/IMU 預測並做為
+              // Local Map 的起點
+              frontend_
+                  ->clearLocalMap(); // 重要：清空上一個無地圖區域留下的舊點雲
+              local_map->clear();    // 同步清空當前幀使用的 local_map 變數
+              local_match_success = true;
+              has_last_keyframe_ = true;
+              last_keyframe_pose_ = current_pose;
+              ROS_INFO("[Local Map] Creating new local map anchor outside HD "
+                       "Map.");
+            }
+
+            if (!local_match_success) {
+              should_skip_frame = true;
+              ROS_WARN_THROTTLE(
+                  1.0, "[Failsafe] Local match failed. Using IMU prediction.");
+            } else {
+              should_skip_frame = false;
+            }
           }
 
           // --- ZUPT (Zero Velocity Update) Detection ---
           static Eigen::Matrix4f last_process_pose =
               Eigen::Matrix4f::Identity();
-          static int static_frame_count = 0;
-          if (first_frame) {
+          static Eigen::Matrix4f last_hd_pose = Eigen::Matrix4f::Identity();
+          static bool has_last_hd_pose = false;
+
+          if (is_first_lidar_frame) {
             last_process_pose = current_pose;
           }
 
-          double frame_dist = (current_pose.block<3, 1>(0, 3) -
-                               last_process_pose.block<3, 1>(0, 3))
-                                  .norm();
-          Eigen::Matrix3f R_curr_proc = current_pose.block<3, 3>(0, 0);
-          Eigen::Matrix3f R_last_proc = last_process_pose.block<3, 3>(0, 0);
-          double frame_angle = std::abs(
-              Eigen::AngleAxisf(R_curr_proc * R_last_proc.transpose()).angle());
+          // 1. 計算 GICP 匹配位姿的前後位置差 (若本幀完成 HD Map 匹配)
+          double match_dist = 999.0;
+          double match_angle = 999.0;
+          if (hd_map_matched_this_frame) {
+            if (has_last_hd_pose) {
+              match_dist =
+                  (hd_pose.block<3, 1>(0, 3) - last_hd_pose.block<3, 1>(0, 3))
+                      .norm();
+              match_angle = std::abs(
+                  Eigen::AngleAxisf(hd_pose.block<3, 3>(0, 0) *
+                                    last_hd_pose.block<3, 3>(0, 0).transpose())
+                      .angle());
+            }
+            last_hd_pose = hd_pose;
+            has_last_hd_pose = true;
+          }
 
-          // 如果一幀內位移小於 2公分 且 旋轉小於 0.005弧度 (約 0.28度)
-          if (frame_dist < 0.02 && frame_angle < 0.005) {
+          // 2. 判斷車輛是否處於物理靜止狀態 (使用地圖匹配差，或高精度 GPS
+          // 位移與速度)
+          bool is_static_by_match =
+              (hd_map_matched_this_frame && has_last_hd_pose &&
+               match_dist < 0.10 && match_angle < 0.01);
+          bool is_static_by_gps =
+              (current_gps_speed < 0.15 && gps_displacement < 0.08);
+
+          static bool was_zupt_locked = false;
+
+          if (is_static_by_match || is_static_by_gps) {
             static_frame_count++;
           } else {
             static_frame_count = 0;
+            if (was_zupt_locked) {
+              ROS_INFO("[ZUPT] Vehicle started moving (GNSS Speed: %.2f). "
+                       "Breaking lock!",
+                       current_gps_speed);
+              was_zupt_locked = false;
+            }
           }
 
           // 連續 3 幀 (0.3秒) 都符合靜止條件，則觸發 ZUPT
           if (static_frame_count >= 3) {
             current_pose = last_process_pose; // 凍結當前位姿，防止點雲抖動
             backend_->addZUPTFactor();        // 告訴後端優化器目前速度為 0
+            was_zupt_locked = true;
             ROS_INFO_THROTTLE(
                 2.0,
                 "[ZUPT] Vehicle is stationary. Applying Zero Velocity Update.");
@@ -629,9 +895,9 @@ private:
           // ---------------------------------------------
 
           // 4. Step A: Update Backend Odometry Factor
-          // We pass hd_map_matched_this_frame to loosen the Odom Factor to
-          // allow instant snapping, and scan_match_failed to prevent bad odom
-          // from dragging
+          // 即使匹配不佳，我們也必須讓後端知道 IMU
+          // 的預測位移，否則預測起點會永遠卡在過去
+          scan_match_failed = should_skip_frame;
           backend_->addOdomFactor(lidar_time, current_pose,
                                   hd_map_matched_this_frame, scan_match_failed,
                                   is_turning);
@@ -641,88 +907,103 @@ private:
             backend_->addHDMapFactor(hd_pose, hd_fitness);
           }
 
-          // 5. Update Backend and Optimize EVERY Frame
-          // DO NOT skip optimization. ISAM2 is very fast.
-          // Skipping optimization causes getCurrentPose to return the LAST
-          // optimized frame, snapping the Lidar point cloud backwards in time
-          // and destroying final_publish.pcd!
+          // 5. Update Backend and Optimize
           int opt_iters = hd_map_matched_this_frame ? 10 : 1;
           backend_->optimize(opt_iters);
 
-          // 6. Add Keyframe
-          static Eigen::Matrix4f last_keyframe_pose =
-              Eigen::Matrix4f::Identity();
-          double dist = (current_pose.block<3, 1>(0, 3) -
-                         last_keyframe_pose.block<3, 1>(0, 3))
-                            .norm();
+          // 獲取優化後的位姿 (即使匹配失敗，這裡也會得到 IMU 修正後的結果)
+          gtsam::Pose3 optimized_pose = backend_->getCurrentPose();
+          Eigen::Matrix4f opt_pose_mat = optimized_pose.matrix().cast<float>();
 
-          Eigen::Matrix3f R_curr = current_pose.block<3, 3>(0, 0);
-          Eigen::Matrix3f R_last = last_keyframe_pose.block<3, 3>(0, 0);
-          Eigen::AngleAxisf aa(R_curr * R_last.transpose());
-          double angle = std::abs(aa.angle());
+          if (static_frame_count >= 3) {
+            // 車輛處於 ZUPT 靜止狀態。
+            // 為了防止 GNSS 雜訊導致優化器產生的 opt_pose_mat
+            // 抖動，我們拋棄 it。
+            delta_transform = Eigen::Matrix4f::Identity();
+            gtsam::Pose3 static_pose3(current_pose.cast<double>());
+            backend_->setCurrentPose(static_pose3);
+          } else {
+            delta_transform = opt_pose_mat * current_pose.inverse();
+            // 同步座標系
+            frontend_->shiftLocalMap(delta_transform);
+            current_pose = opt_pose_mat;
+            backend_->setCurrentPose(optimized_pose);
+          }
 
-          if (dist > 0.3 || angle > 0.1) {
-            int current_idx = frontend_->getKeyframeCount();
-            frontend_->addKeyframeCloud(cloud, current_pose);
-            last_keyframe_pose = current_pose;
+          // 6. 新增 Keyframe 與發布資料
+          // "批配成功的點雲才能製作localmap"
+          // 當我們在 HD Map 外，或在 HD Map
+          // 內但處於轉彎及20m緩衝期時，將點雲加入 Local Map 進行延伸
+          if ((!currently_within_hd_bounds || use_temp_local_map) &&
+              local_match_success) {
+            if (!has_last_keyframe_) {
+              last_keyframe_pose_ = current_pose;
+              has_last_keyframe_ = true;
+            }
 
-            // 7. Optional Loop Closure Detection
-            if (loop_closure_enabled_) {
-              int loop_idx;
-              Eigen::Matrix4f rel_pose;
-              double loop_fitness;
-              if (frontend_->detectLoopClosure(
-                      current_pose, loop_closure_search_radius_, loop_idx,
-                      rel_pose, loop_fitness)) {
-                if (loop_fitness < loop_closure_fitness_score_) {
-                  backend_->addLoopFactor(loop_idx, rel_pose, loop_fitness);
-                  // Trigger an extra optimization for the loop
-                  backend_->optimize(10);
+            last_keyframe_pose_ = delta_transform * last_keyframe_pose_;
+
+            double dist = (current_pose.block<3, 1>(0, 3) -
+                           last_keyframe_pose_.block<3, 1>(0, 3))
+                              .norm();
+            Eigen::Matrix3f R_curr = current_pose.block<3, 3>(0, 0);
+            Eigen::Matrix3f R_last = last_keyframe_pose_.block<3, 3>(0, 0);
+            double angle = std::abs(
+                Eigen::AngleAxisf(R_curr * R_last.transpose()).angle());
+
+            if (dist > 1.0 || angle > 0.2 || !frontend_->hasKeyframes()) {
+              frontend_->addKeyframeCloud(cloud, current_pose);
+              last_keyframe_pose_ = current_pose;
+
+              // 7. Loop Closure (只有在完全沒有 HD Map 時才進行全域迴圈偵測)
+              if (!currently_within_hd_bounds && loop_closure_enabled_ &&
+                  !should_skip_frame) {
+                int loop_idx;
+                Eigen::Matrix4f rel_pose;
+                double loop_fitness;
+                if (frontend_->detectLoopClosure(
+                        current_pose, loop_closure_search_radius_, loop_idx,
+                        rel_pose, loop_fitness)) {
+                  if (loop_fitness < loop_closure_fitness_score_) {
+                    backend_->addLoopFactor(loop_idx, rel_pose, loop_fitness);
+                    backend_->optimize(10);
+                  }
                 }
               }
             }
+
+            // 7. 更新 Local Map 用於下一幀匹配與發布
+            frontend_->getLocalMap(local_map);
           }
-
-          // Fetch the smoothed pose from ISAM2 for this newly added frame
-          gtsam::Pose3 optimized_pose = backend_->getCurrentPose();
-
-          // CRITICAL FIX: Tightly couple the frontend and backend!
-          // We shift the ENTIRE frontend coordinate system to align with the
-          // optimized pose every frame. This elegantly handles GPS corrections,
-          // Loop Closures, and HD Map snaps automatically without needing
-          // duplicated logic.
-          Eigen::Matrix4f opt_pose_mat = optimized_pose.matrix().cast<float>();
-          delta_transform = opt_pose_mat * current_pose.inverse();
-
-          // 1. Shift the frontend map history so the next ICP matches in the
-          // correct global frame
-          frontend_->shiftLocalMap(delta_transform);
-
-          // 2. Update the current pose
-          current_pose = opt_pose_mat;
-
-          // 3. Shift the last keyframe pose tracker to prevent instant false
-          // keyframe drops
-          last_keyframe_pose = delta_transform * last_keyframe_pose;
-
-          // 4. Update the backend's internal baseline (prev_lidar_pose_) so
-          // the next relative_odom is correct
-          backend_->setCurrentPose(optimized_pose);
+          latest_pose_ = current_pose;
         } else {
-          // For skipped frames, perform safely bounded prediction from IMU
+          // 對於跳過的幀（頻率限制），我們僅使用 IMU 預測位姿進行補間發布
           Eigen::Matrix4f predicted_pose =
               backend_->getPredictedPose().matrix().cast<float>();
           double predict_jump = (predicted_pose.block<3, 1>(0, 3) -
                                  current_pose.block<3, 1>(0, 3))
                                     .norm();
-          if (predict_jump < 3.0) {
+          Eigen::Matrix3f R_curr = current_pose.block<3, 3>(0, 0);
+          Eigen::Matrix3f R_pred = predicted_pose.block<3, 3>(0, 0);
+          double predict_angle =
+              std::abs(Eigen::AngleAxisf(R_pred * R_curr.transpose()).angle());
+          if (predict_jump < max_trans_jump_ && predict_angle < max_rot_jump_) {
             current_pose = predicted_pose;
           }
-          ROS_INFO_THROTTLE(1.0, "[INFO] Skip Scan Matching.");
+          ROS_INFO_THROTTLE(5.0,
+                            "[INFO] Skip Scan Matching (Frequency limit).");
         }
 
-        // 7. Final Visualization (Always publish at lidar rate)
-        publishData(lidar_time, current_pose, cloud, local_map);
+        // 8. Final Visualization (Always publish at lidar rate, but avoid
+        // redundant stamps)
+        static double last_published_lidar_time = -1.0;
+        if (lidar_time > last_published_lidar_time) {
+          // 在發布前重新獲取一次 Local Map，確保最新加入的 Keyframe
+          // 也能立即顯示
+          frontend_->getLocalMap(local_map);
+          publishData(lidar_time, current_pose, cloud, local_map);
+          last_published_lidar_time = lidar_time;
+        }
         latest_pose_ = current_pose;
 
         /*
@@ -753,7 +1034,7 @@ private:
   ros::NodeHandle nh_;
   ros::Subscriber sub_lidar_, sub_gps_, sub_imu_;
   ros::Publisher pub_odom_, pub_path_, pub_current_cloud_, pub_hd_map_,
-      pub_local_map_, pub_fitness_, pub_gps_path_;
+      pub_local_map_, pub_fitness_, pub_gps_path_, pub_range_rings_;
   nav_msgs::Path global_path_, gps_path_;
   tf2_ros::TransformBroadcaster tf_broadcaster_;
   std::shared_ptr<SensorPreprocess> preprocess_;
@@ -779,6 +1060,8 @@ private:
   bool out_save_;
   double out_hz_;
   double tile_size;
+  double max_trans_jump_;
+  double max_rot_jump_;
 
   // Loop Closure Parameters
   bool loop_closure_enabled_;
@@ -786,6 +1069,9 @@ private:
   pcl::KdTreeFLANN<PointType>::Ptr hd_map_kdtree_;
   double loop_closure_search_radius_;
   double loop_closure_fitness_score_;
+
+  Eigen::Matrix4f last_keyframe_pose_ = Eigen::Matrix4f::Identity();
+  bool has_last_keyframe_ = false;
 
   PointCloudType::Ptr current_global_map_;
   double last_imu_time_internal_ = -1.0;
@@ -842,6 +1128,14 @@ private:
   void publishData(double ts, const Eigen::Matrix4f &pose,
                    const PointCloudType::Ptr &cloud,
                    const PointCloudType::Ptr &local_map) {
+    // 只有在 HD Map
+    // 已經加載且點雲成功對地圖完成第一次匹配後，才允許發布任何資料 (包含
+    // TF、點雲與里程計) 這能完全避免在匹配成功前，RViz
+    // 畫面上先顯示錯誤坐標的點雲與軌跡，消除瞬間巨大跳變！
+    if (!first_map_check_done_ || !has_hd_map_matched_) {
+      return;
+    }
+
     ros::Time rts(ts);
 
     // 1. Publish Path & Pose
@@ -857,9 +1151,15 @@ private:
     ps.pose.orientation.y = q.y();
     ps.pose.orientation.z = q.z();
 
-    global_path_.header.stamp = rts;
-    global_path_.poses.push_back(ps);
-    pub_path_.publish(global_path_);
+    // 只有在 HD Map
+    // 已經加載且點雲成功對地圖完成第一次匹配後，才允許開始繪製軌跡 (Path)
+    // 這能確保第一個 Path
+    // 的位置就是精準匹配完的位置，完全消除軌跡起點的側向跳變！
+    if (first_map_check_done_ && has_hd_map_matched_) {
+      global_path_.header.stamp = rts;
+      global_path_.poses.push_back(ps);
+      pub_path_.publish(global_path_);
+    }
 
     // 2. Broadcast TF (map -> lidar)
     geometry_msgs::TransformStamped tf_msg;
@@ -893,13 +1193,25 @@ private:
     pub_odom_.publish(odom);
 
     // 4.5 Publish Local Map
+    sensor_msgs::PointCloud2 local_map_msg;
     if (local_map && !local_map->empty()) {
-      sensor_msgs::PointCloud2 local_map_msg;
       pcl::toROSMsg(*local_map, local_map_msg);
-      local_map_msg.header.stamp = rts;
-      local_map_msg.header.frame_id = "map";
-      pub_local_map_.publish(local_map_msg);
+    } else {
+      // 發布隱形假點強迫 RViz 清除畫面上的舊 Local Map
+      PointCloudType dummy_map;
+      PointType p;
+      p.x = 0;
+      p.y = 0;
+      p.z = -10000.0;
+      dummy_map.push_back(p);
+      pcl::toROSMsg(dummy_map, local_map_msg);
     }
+    local_map_msg.header.stamp = rts;
+    local_map_msg.header.frame_id = "map";
+    pub_local_map_.publish(local_map_msg);
+
+    // 4.8 Publish Range Rings (5m & 10m)
+    publishRangeRings(rts);
 
     // 5. Record Trajectory Point at specified out_hz_
     if (has_map_origin_) {
@@ -942,6 +1254,45 @@ private:
         recorded_trajectory_.push_back(tp);
       }
     }
+  }
+
+  void publishRangeRings(const ros::Time &stamp) {
+    visualization_msgs::MarkerArray marker_array;
+
+    auto createCircle = [&](int id, double radius, double r, double g,
+                            double b) {
+      visualization_msgs::Marker marker;
+      marker.header.frame_id = "lidar"; // Follow the lidar sensor
+      marker.header.stamp = stamp;
+      marker.ns = "range_rings";
+      marker.id = id;
+      marker.type = visualization_msgs::Marker::LINE_STRIP;
+      marker.action = visualization_msgs::Marker::ADD;
+      marker.scale.x = 1; // Line width
+      marker.color.r = r;
+      marker.color.g = g;
+      marker.color.b = b;
+      marker.color.a = 0.5;
+      marker.pose.orientation.w = 1.0;
+
+      int num_segments = 100;
+      for (int i = 0; i <= num_segments; ++i) {
+        double angle = 2.0 * M_PI * i / num_segments;
+        geometry_msgs::Point p;
+        p.x = radius * std::cos(angle);
+        p.y = radius * std::sin(angle);
+        p.z = 0.0;
+        marker.points.push_back(p);
+      }
+      return marker;
+    };
+
+    marker_array.markers.push_back(
+        createCircle(0, 5.0, 0.0, 1.0, 1.0)); // Cyan 5m
+    marker_array.markers.push_back(
+        createCircle(1, 10.0, 0.0, 1.0, 1.0)); // Cyan 10m
+
+    pub_range_rings_.publish(marker_array);
   }
 };
 

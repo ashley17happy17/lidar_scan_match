@@ -25,7 +25,8 @@ public:
 
   // Add Odometry derived from Fast-ICP
   void addOdomFactor(double timestamp, const Eigen::Matrix4f &odom_transform,
-                     bool is_hd_map_anchor = false, bool scan_match_failed = false, bool is_turning = false);
+                     bool is_hd_map_anchor = false,
+                     bool scan_match_failed = false, bool is_turning = false);
 
   // Add Zero Velocity Update Factor
   void addZUPTFactor();
@@ -56,7 +57,7 @@ public:
 
   // Loop Closure support
   void addLoopFactor(int historical_idx, const Eigen::Matrix4f &relative_pose,
-                    double fitness);
+                     double fitness);
 
   // Get extrinsics (IMU to Lidar)
   gtsam::Pose3 getExtrinsic() const { return imu2Lidar_; }
@@ -83,7 +84,7 @@ private:
 
   // Noise params
   double accBiasN_, gyrBiasN_;
-  
+
   // Flag to toggle IMU usage for both factor graph and prediction
   bool use_imu_{false};
 };

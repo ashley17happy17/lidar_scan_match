@@ -150,17 +150,10 @@ void BackEndOptimization::addOdomFactor(double timestamp,
     gtsam::Pose3 prev_imu_pose = prev_lidar_pose_.compose(imu2Lidar_.inverse());
     gtsam::Pose3 relative_odom = prev_imu_pose.between(imu_pose);
 
-    // Safety check for lidar odom jump, HD Map Anchor, or scan match failure
-    if (is_hd_map_anchor || scan_match_failed ||
-        relative_odom.translation().norm() > 10.0) {
+    // Safety check for lidar odom jump or HD Map Anchor
+    if (is_hd_map_anchor || relative_odom.translation().norm() > 10.0) {
       if (is_hd_map_anchor) {
-        // ROS_INFO_THROTTLE(1.0, "[BackEnd] HD Map Anchor Frame: Loosening Odom
-        // "
-        //                        "constraint to allow snapping.");
-      } else if (scan_match_failed) {
-        ROS_WARN_THROTTLE(
-            1.0, "[BackEnd] Scan Match Failed! Using loose Odom constraints "
-                 "to prevent dragging the graph.");
+        // Allow snapping to HD map
       } else {
         ROS_WARN_THROTTLE(1.0,
                           "[BackEnd] Large odom jump detected (%.2fm)! Using "
@@ -173,23 +166,27 @@ void BackEndOptimization::addOdomFactor(double timestamp,
       gtsam_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
           X(key_index_ - 1), X(key_index_), relative_odom, loose_noise));
     } else {
-      // 轉彎時，我們將 Lidar Odometry 的變異數大幅放大 (從 5e-2 改為 2e-1)，
-      // 這會讓 GTSAM 後端認為「轉彎時的光達極度不可靠」，進而把權重全部交給 IMU 的預積分與 GPS。
-      double odom_rot_var = is_turning ? 2e-1 : 1e-4; // 直線路段嚴格要求航向角(變異數 1e-4)
-      double odom_trans_var = is_turning ? 2e-1 : 1e-2;
-      gtsam::noiseModel::Diagonal::shared_ptr odom_noise =
-          gtsam::noiseModel::Diagonal::Variances(
-              (gtsam::Vector(6) << odom_rot_var, odom_rot_var, odom_rot_var,
-               odom_trans_var, odom_trans_var, odom_trans_var)
-                  .finished());
-      gtsam_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
-          X(key_index_ - 1), X(key_index_), relative_odom, odom_noise));
+      if (scan_match_failed) {
+        // 如果是 Skip Frame (例如依賴 IMU 預測)，放寬 Odom 約束
+        gtsam::noiseModel::Diagonal::shared_ptr loose_noise =
+            gtsam::noiseModel::Isotropic::Sigma(6, 5.0);
+        gtsam_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            X(key_index_ - 1), X(key_index_), relative_odom, loose_noise));
+      } else {
+        // 轉彎時，我們將 Lidar Odometry 的變異數大幅放大
+        double odom_rot_var = is_turning ? 1e-3 : 1e-4;
+        double odom_trans_var = is_turning ? 2e-2 : 1e-2;
+        gtsam::noiseModel::Diagonal::shared_ptr odom_noise =
+            gtsam::noiseModel::Diagonal::Variances(
+                (gtsam::Vector(6) << odom_rot_var, odom_rot_var, odom_rot_var,
+                 odom_trans_var, odom_trans_var, odom_trans_var)
+                    .finished());
+        gtsam_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            X(key_index_ - 1), X(key_index_), relative_odom, odom_noise));
+      }
 
       // 側向移動與垂直移動約制 (Non-Holonomic Constraint, NHC)
-      // 假設車輛不會產生側向滑動 (Y=0) 和起飛/遁地 (Z=0)。
-      // 透過加入這個虛擬約束，可以有效把 Lidar ICP 產生的側向漂移拉回。
-      // 但是在轉彎時，感測器會有真實的側向速度，如果強制約束 Y=0
-      // 反而會造成軌跡偏移，所以我們在轉彎時放寬它。
+      // 非常重要：即使是 Skip Frame，車子物理上依然不能橫向滑行，必須保留 NHC！
       gtsam::Pose3 nhc_pose(
           relative_odom.rotation(),
           gtsam::Point3(relative_odom.translation().x(), 0.0, 0.0));
@@ -199,8 +196,6 @@ void BackEndOptimization::addOdomFactor(double timestamp,
           gtsam::noiseModel::Diagonal::Variances(
               (gtsam::Vector(6) << 1e6, 1e6, 1e6, 1e6, nhc_y_var, 1e-3)
                   .finished());
-      // X 軸移動和所有旋轉都給予極大變異數(1e6)，代表完全不約束。
-      // 只約束 Y 軸 (變異數 1e-4 或轉彎時 1e-1) 和 Z 軸 (變異數 1e-3)。
       gtsam_graph_.add(gtsam::BetweenFactor<gtsam::Pose3>(
           X(key_index_ - 1), X(key_index_), nhc_pose, nhc_noise));
     }
@@ -237,6 +232,9 @@ void BackEndOptimization::addZUPTFactor() {
       gtsam::noiseModel::Isotropic::Sigma(3, 1e-3);
   gtsam_graph_.add(gtsam::PriorFactor<gtsam::Vector3>(
       V(key_index_ - 1), gtsam::Vector3::Zero(), zero_vel_noise));
+
+  // 同時清空 IMU 預測器的殘餘速度，防止預測位姿發生漂移，從而破壞前端的靜止偵測
+  prev_state_ = gtsam::NavState(prev_state_.pose(), gtsam::Vector3::Zero());
 }
 
 void BackEndOptimization::addGpsFactor(const GpsMeasurement &gps) {

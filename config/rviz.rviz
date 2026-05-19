@@ -14,6 +14,7 @@ Panels:
         - /Axes1
         - /Axes2
         - /TF1
+        - /MarkerArray1
       Splitter Ratio: 0.5
     Tree Height: 1592
   - Class: rviz/Selection
@@ -96,7 +97,7 @@ Visualization Manager:
       Axis: Z
       Channel Name: intensity
       Class: rviz/PointCloud2
-      Color: 185; 185; 185
+      Color: 0; 255; 0
       Color Transformer: FlatColor
       Decay Time: 0
       Enabled: true
@@ -232,6 +233,14 @@ Visualization Manager:
             {}
       Update Interval: 0
       Value: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Marker Topic: /lidar_scan_match_c/range_rings
+      Name: MarkerArray
+      Namespaces:
+        range_rings: true
+      Queue Size: 1
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -260,7 +269,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 1185.92919921875
+      Distance: 567.7015991210938
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -268,17 +277,17 @@ Visualization Manager:
         Value: false
       Field of View: 0.7853981852531433
       Focal Point:
-        X: -96.08385467529297
-        Y: -91.16729736328125
-        Z: -233.4796142578125
+        X: -102.74307250976562
+        Y: -5.281777381896973
+        Z: -185.96112060546875
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.2647958993911743
+      Pitch: 1.5647963285446167
       Target Frame: <Fixed Frame>
-      Yaw: 3.7908952236175537
+      Yaw: 3.415893793106079
     Saved: ~
 Window Geometry:
   Displays:
@@ -297,4 +306,4 @@ Window Geometry:
     collapsed: true
   Width: 1200
   X: 0
-  Y: 0
+  Y: 27
