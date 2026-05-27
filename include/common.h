@@ -17,7 +17,7 @@ namespace lidar_scan_match_c {
 
 // Define common point types
 using PointType = pcl::PointXYZI;
-using PointCloudType = pcl::PointCloud<PointType>;
+using CloudType = pcl::PointCloud<PointType>;
 
 // Define structures for sensor measurements
 struct ImuMeasurement {

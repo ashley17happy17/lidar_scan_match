@@ -12,7 +12,7 @@
 namespace lidar_scan_match_c {
 
 std::shared_ptr<small_gicp::PointCloud>
-toGicpCloud(const PointCloudType::Ptr &pcl_cloud) {
+toGicpCloud(const CloudType::Ptr &pcl_cloud) {
   auto gicp_cloud = std::make_shared<small_gicp::PointCloud>();
   gicp_cloud->points.resize(pcl_cloud->size());
   for (size_t i = 0; i < pcl_cloud->size(); ++i) {
@@ -74,7 +74,7 @@ void FrontEndICP::setInitialGuess(const Eigen::Matrix4f &guess) {
   // Left for future IMU/Odom prediction seeding
 }
 
-void FrontEndICP::updateHDMapCloud(const PointCloudType::Ptr &cloud) {
+void FrontEndICP::updateHDMapCloud(const CloudType::Ptr &cloud) {
   if (cloud->empty())
     return;
 
@@ -97,8 +97,8 @@ void FrontEndICP::updateHDMapCloud(const PointCloudType::Ptr &cloud) {
   ROS_INFO("HD Map updated and small_gicp tree precomputed (non-blocking).");
 }
 
-bool FrontEndICP::scanMatch(const PointCloudType::Ptr &source_cloud,
-                            const PointCloudType::Ptr &target_cloud,
+bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
+                            const CloudType::Ptr &target_cloud,
                             Eigen::Matrix4f &out_transform,
                             double &out_fitness_score, bool is_turning) {
   if (source_cloud->empty() || target_cloud->empty())
@@ -161,7 +161,7 @@ bool FrontEndICP::scanMatch(const PointCloudType::Ptr &source_cloud,
   /*
   // === DEBUG: 永遠存下匹配完的點雲供 CloudCompare 檢視 ===
   {
-    PointCloudType::Ptr matched_pcl_debug(new PointCloudType());
+    CloudType::Ptr matched_pcl_debug(new CloudType());
     // 用最後算出的轉換矩陣 (T_res) 來轉換來源點雲
     pcl::transformPointCloud(*source_cloud, *matched_pcl_debug, out_transform);
 
@@ -195,7 +195,7 @@ bool FrontEndICP::scanMatch(const PointCloudType::Ptr &source_cloud,
   }
 }
 
-bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
+bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
                                    Eigen::Matrix4f &out_transform,
                                    double &out_fitness_score, bool is_turning) {
   if (!current_cloud || current_cloud->empty())
@@ -233,7 +233,7 @@ bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
   /*
   // --- DEBUG: Save clouds to check overlap ---
   {
-    PointCloudType::Ptr source_pcl_debug(new PointCloudType());
+    CloudType::Ptr source_pcl_debug(new CloudType());
     // Transform current cloud by initial guess to see if it's close to map
     pcl::transformPointCloud(*current_cloud, *source_pcl_debug, out_transform);
 
@@ -242,7 +242,7 @@ bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
         *source_pcl_debug);
 
     // Convert small_gicp target back to PCL for saving
-    PointCloudType::Ptr target_pcl_debug(new PointCloudType());
+    CloudType::Ptr target_pcl_debug(new CloudType());
 
     // 1. 改用 resize 預先劃分好確定的記憶體空間，徹底避開 push_back的長度檢查
     target_pcl_debug->points.resize(target_gicp->points.size());
@@ -295,7 +295,7 @@ bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
   /*
 // === DEBUG: 永遠存下 光達對地圖(HD Map) 的匹配結果 ===
 {
-  PointCloudType::Ptr matched_pcl_debug(new PointCloudType());
+  CloudType::Ptr matched_pcl_debug(new CloudType());
   pcl::transformPointCloud(*current_cloud, *matched_pcl_debug, out_transform);
   pcl::io::savePCDFileBinary(
       "/root/catkin_ws/src/lidar_scan_match_c/scan_to_map_source_matched.pcd",
@@ -316,9 +316,9 @@ bool FrontEndICP::scanToHDMapMatch(const PointCloudType::Ptr &current_cloud,
   return result.converged;
 }
 
-void FrontEndICP::addKeyframeCloud(const PointCloudType::Ptr &cloud,
+void FrontEndICP::addKeyframeCloud(const CloudType::Ptr &cloud,
                                    const Eigen::Matrix4f &pose) {
-  PointCloudType::Ptr cloned_cloud(new PointCloudType(*cloud));
+  CloudType::Ptr cloned_cloud(new CloudType(*cloud));
   keyframe_clouds_.push_back(cloned_cloud);
   keyframe_poses_.push_back(pose);
 }
@@ -334,7 +334,7 @@ void FrontEndICP::shiftLocalMap(const Eigen::Matrix4f &delta_transform) {
   }
 }
 
-void FrontEndICP::getLocalMap(PointCloudType::Ptr &out_local_map) {
+void FrontEndICP::getLocalMap(CloudType::Ptr &out_local_map) {
   out_local_map->clear();
   int num_keyframes = keyframe_clouds_.size();
   if (num_keyframes == 0)
@@ -345,7 +345,7 @@ void FrontEndICP::getLocalMap(PointCloudType::Ptr &out_local_map) {
   int start_idx = std::max(0, num_keyframes - window_size);
 
   for (int i = start_idx; i < num_keyframes; ++i) {
-    PointCloudType::Ptr transformed_kf(new PointCloudType());
+    CloudType::Ptr transformed_kf(new CloudType());
     pcl::transformPointCloud(*keyframe_clouds_[i], *transformed_kf,
                              keyframe_poses_[i]);
     *out_local_map += *transformed_kf;

@@ -201,7 +201,7 @@ private:
         double p_y = current_pos.y() + map_origin_twd97_.y();
         double p_z = current_pos.z() + map_origin_twd97_.z();
 
-        PointCloudType::Ptr merged_tiles(new PointCloudType());
+        CloudType::Ptr merged_tiles(new CloudType());
         if (available_map_tiles_.empty()) {
           try {
             if (std::filesystem::exists(hd_map_dir) &&
@@ -237,7 +237,7 @@ private:
               std::abs(tile_info.offset_y + tile_size / 2.0 - p_y) <=
                   tile_size * 1.5 &&
               std::abs(tile_info.offset_z - p_z) <= 35.0) {
-            PointCloudType::Ptr tile = loadPcdCloud(tile_info.filepath);
+            CloudType::Ptr tile = loadPcdCloud(tile_info.filepath);
             if (tile && !tile->empty()) {
               Eigen::Affine3f T = Eigen::Affine3f::Identity();
               T.translation() << (tile_info.offset_x - map_origin_twd97_.x()),
@@ -255,7 +255,7 @@ private:
 
         if (!merged_tiles->empty()) {
           // Optimized for real-time: Downsample the HD map to 0.5m density
-          PointCloudType::Ptr optimized_map(new PointCloudType());
+          CloudType::Ptr optimized_map(new CloudType());
           pcl::VoxelGrid<PointType> vg;
           vg.setLeafSize(0.5f, 0.5f, 0.5f);
           vg.setInputCloud(merged_tiles);
@@ -285,7 +285,7 @@ private:
             }
           }
           if (need_clear) {
-            PointCloudType::Ptr empty_map(new PointCloudType());
+            CloudType::Ptr empty_map(new CloudType());
             frontend_->updateHDMapCloud(empty_map);
             ROS_INFO("Car left HD map area. Map cleared.");
             publishHDMap();
@@ -301,7 +301,7 @@ private:
     ros::Rate rate(50);
     bool system_initialized = false;
     Eigen::Matrix4f current_pose = Eigen::Matrix4f::Identity();
-    PointCloudType::Ptr local_map(new PointCloudType());
+    CloudType::Ptr local_map(new CloudType());
 
     while (ros::ok()) {
       sensor_msgs::PointCloud2ConstPtr lidar_msg = nullptr;
@@ -508,7 +508,7 @@ private:
         }
       }
 
-      PointCloudType::Ptr cloud(new PointCloudType());
+      CloudType::Ptr cloud(new CloudType());
       preprocess_->processCloud(lidar_msg, cloud);
 
       try {
@@ -1009,7 +1009,7 @@ private:
         /*
         // === DEBUG: 永遠存下 光達對地圖(HD Map) 的匹配結果 ===
         {
-          PointCloudType::Ptr matched_pcl_debug(new PointCloudType());
+          CloudType::Ptr matched_pcl_debug(new CloudType());
           pcl::transformPointCloud(*cloud, *matched_pcl_debug, current_pose);
           pcl::io::savePCDFileBinary("/root/catkin_ws/src/lidar_scan_match_c/"
                                      "final_publish.pcd",
@@ -1073,20 +1073,20 @@ private:
   Eigen::Matrix4f last_keyframe_pose_ = Eigen::Matrix4f::Identity();
   bool has_last_keyframe_ = false;
 
-  PointCloudType::Ptr current_global_map_;
+  CloudType::Ptr current_global_map_;
   double last_imu_time_internal_ = -1.0;
   double last_record_time_ = -1.0;
 
-  PointCloudType::Ptr loadPcdCloud(const std::string &path) {
-    PointCloudType::Ptr cloud(new PointCloudType);
+  CloudType::Ptr loadPcdCloud(const std::string &path) {
+    CloudType::Ptr cloud(new CloudType);
     if (pcl::io::loadPCDFile<PointType>(path, *cloud) == -1) {
       ROS_ERROR_THROTTLE(5.0, "Couldn't read PCD file: %s", path.c_str());
     }
     return cloud;
   }
 
-  PointCloudType::Ptr loadBinCloud(const std::string &path) {
-    PointCloudType::Ptr cloud(new PointCloudType);
+  CloudType::Ptr loadBinCloud(const std::string &path) {
+    CloudType::Ptr cloud(new CloudType);
     std::ifstream f(path, std::ios::binary);
     if (!f)
       return cloud;
@@ -1110,7 +1110,7 @@ private:
     sensor_msgs::PointCloud2 msg;
     if (!current_global_map_ || current_global_map_->empty()) {
       // 為了強迫 RViz 清除畫面上舊的地圖，發佈一個藏在地底下的隱形假點
-      PointCloudType dummy_map;
+      CloudType dummy_map;
       PointType p;
       p.x = 0;
       p.y = 0;
@@ -1126,8 +1126,8 @@ private:
   }
 
   void publishData(double ts, const Eigen::Matrix4f &pose,
-                   const PointCloudType::Ptr &cloud,
-                   const PointCloudType::Ptr &local_map) {
+                   const CloudType::Ptr &cloud,
+                   const CloudType::Ptr &local_map) {
     // 只有在 HD Map
     // 已經加載且點雲成功對地圖完成第一次匹配後，才允許發布任何資料 (包含
     // TF、點雲與里程計) 這能完全避免在匹配成功前，RViz
@@ -1176,7 +1176,7 @@ private:
     tf_broadcaster_.sendTransform(tf_msg);
 
     // 3. Publish Matched Cloud in Map Frame
-    PointCloudType::Ptr world_cloud(new PointCloudType());
+    CloudType::Ptr world_cloud(new CloudType());
     pcl::transformPointCloud(*cloud, *world_cloud, pose);
     sensor_msgs::PointCloud2 cloud_msg;
     pcl::toROSMsg(*world_cloud, cloud_msg);
@@ -1198,7 +1198,7 @@ private:
       pcl::toROSMsg(*local_map, local_map_msg);
     } else {
       // 發布隱形假點強迫 RViz 清除畫面上的舊 Local Map
-      PointCloudType dummy_map;
+      CloudType dummy_map;
       PointType p;
       p.x = 0;
       p.y = 0;
@@ -1268,12 +1268,21 @@ private:
       marker.id = id;
       marker.type = visualization_msgs::Marker::LINE_STRIP;
       marker.action = visualization_msgs::Marker::ADD;
-      marker.scale.x = 1; // Line width
+      marker.scale.x = 0.5; // Line width (changed from 1.0m to 5cm)
+
+      // Explicitly initialize position and orientation
+      marker.pose.position.x = 0.0;
+      marker.pose.position.y = 0.0;
+      marker.pose.position.z = 0.0;
+      marker.pose.orientation.x = 0.0;
+      marker.pose.orientation.y = 0.0;
+      marker.pose.orientation.z = 0.0;
+      marker.pose.orientation.w = 1.0;
+
       marker.color.r = r;
       marker.color.g = g;
       marker.color.b = b;
-      marker.color.a = 0.5;
-      marker.pose.orientation.w = 1.0;
+      marker.color.a = 1.0; // Changed to 1.0 for better visibility in RViz
 
       int num_segments = 100;
       for (int i = 0; i <= num_segments; ++i) {

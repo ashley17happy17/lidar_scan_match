@@ -11,15 +11,14 @@ public:
 
   // Processes an incoming raw point cloud
   void processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
-                    PointCloudType::Ptr &out_cloud);
+                    CloudType::Ptr &out_cloud);
 
   // Matches the MATLAB lidarPreprocess: denoising
-  void denoiseCloud(const PointCloudType::Ptr &in_cloud,
-                    PointCloudType::Ptr &out_cloud);
+  void denoiseCloud(const CloudType::Ptr &in_cloud, CloudType::Ptr &out_cloud);
 
   // Motion compensation (deskew)
-  void motionCompensate(const PointCloudType::Ptr &in_cloud,
-                        PointCloudType::Ptr &out_cloud);
+  void motionCompensate(const CloudType::Ptr &in_cloud,
+                        CloudType::Ptr &out_cloud);
 
 private:
   double leaf_size_;

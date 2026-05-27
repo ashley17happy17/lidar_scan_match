@@ -11,23 +11,23 @@ SensorPreprocess::SensorPreprocess(ros::NodeHandle &nh) {
 }
 
 void SensorPreprocess::processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
-                                    PointCloudType::Ptr &out_cloud) {
-  PointCloudType::Ptr raw_cloud(new PointCloudType());
+                                    CloudType::Ptr &out_cloud) {
+  CloudType::Ptr raw_cloud(new CloudType());
 
   pcl::fromROSMsg(*msg, *raw_cloud);
 
-  PointCloudType::Ptr denoised_cloud(new PointCloudType());
+  CloudType::Ptr denoised_cloud(new CloudType());
   denoiseCloud(raw_cloud, denoised_cloud);
 
   motionCompensate(denoised_cloud, out_cloud);
 }
 
-void SensorPreprocess::denoiseCloud(const PointCloudType::Ptr &in_cloud,
-                                    PointCloudType::Ptr &out_cloud) {
+void SensorPreprocess::denoiseCloud(const CloudType::Ptr &in_cloud,
+                                    CloudType::Ptr &out_cloud) {
   // Crop points around the vehicle to avoid matching dynamic objects (e.g. ego
   // body, adjacent cars) but keep the ground points (where p.z <=
   // crop_vehicle_z_)
-  PointCloudType::Ptr cropped_cloud(new PointCloudType());
+  CloudType::Ptr cropped_cloud(new CloudType());
   cropped_cloud->points.reserve(in_cloud->size());
 
   for (const auto &p : in_cloud->points) {
@@ -46,8 +46,8 @@ void SensorPreprocess::denoiseCloud(const PointCloudType::Ptr &in_cloud,
   downSizeFilter_.filter(*out_cloud);
 }
 
-void SensorPreprocess::motionCompensate(const PointCloudType::Ptr &in_cloud,
-                                        PointCloudType::Ptr &out_cloud) {
+void SensorPreprocess::motionCompensate(const CloudType::Ptr &in_cloud,
+                                        CloudType::Ptr &out_cloud) {
   // Implement deskew logic using IMU preintegration or constant velocity model
   // For now, pass through
   *out_cloud = *in_cloud;
