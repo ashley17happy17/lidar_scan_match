@@ -509,7 +509,8 @@ private:
       }
 
       CloudType::Ptr cloud(new CloudType());
-      preprocess_->processCloud(lidar_msg, cloud);
+      std::vector<double> timestamps;
+      preprocess_->processCloud(lidar_msg, cloud, timestamps);
 
       try {
         // Frequency control: Only perform Scan Matching at the specified rate
@@ -517,6 +518,7 @@ private:
             (last_reg_time_ < 0) ||
             (lidar_time - last_reg_time_ >= (0.95 / lidar_rps_));
 
+        double prev_reg_time_ = last_reg_time_;
         if (run_matching) {
           last_reg_time_ = lidar_time;
 
@@ -548,6 +550,44 @@ private:
           } else {
             first_frame = false;
             ROS_INFO("[Init] Processing first Lidar frame...");
+          }
+
+          // ==== MOTION COMPENSATION ====
+          if (!is_first_lidar_frame && !timestamps.empty() &&
+              prev_reg_time_ > 0) {
+            auto t_mc_start = std::chrono::high_resolution_clock::now();
+
+            auto poseToVector = [](double time, const Eigen::Matrix4f &pose) {
+              Eigen::VectorXd vec(7);
+              vec(0) = time;
+              vec(1) = pose(0, 3);
+              vec(2) = pose(1, 3);
+              vec(3) = pose(2, 3);
+              Eigen::Matrix3f R = pose.block<3, 3>(0, 0);
+              Eigen::Vector3f euler =
+                  R.eulerAngles(2, 1, 0);       // Yaw, Pitch, Roll
+              vec(4) = euler[2] * 180.0 / M_PI; // Roll
+              vec(5) = euler[1] * 180.0 / M_PI; // Pitch
+              vec(6) = euler[0] * 180.0 / M_PI; // Yaw
+              return vec;
+            };
+
+            Eigen::VectorXd posPrev =
+                poseToVector(prev_reg_time_, latest_pose_);
+            Eigen::VectorXd posCurr = poseToVector(lidar_time, predicted_pose);
+
+            lidar_utils::CloudUtils::motionCompensateAndDG(
+                cloud, timestamps, posPrev, posCurr, true);
+
+            // Revert the cloud from global frame back to lidar frame, as
+            // scanToHDmap will input the init_guess pose itself
+            pcl::transformPointCloud(*cloud, *cloud, predicted_pose.inverse());
+
+            auto t_mc_end = std::chrono::high_resolution_clock::now();
+            ROS_INFO_THROTTLE(
+                1.0, "[BackEnd] Time - Motion Compensation: %.2f ms",
+                std::chrono::duration<double, std::milli>(t_mc_end - t_mc_start)
+                    .count());
           }
 
           bool scan_match_failed = false;
@@ -680,10 +720,42 @@ private:
             }
             was_in_hd_map = true;
 
-            // == 1. 全域匹配 (HD Map) ==
+            // == 1. 局部匹配與建圖 (Local Map) ==
+            // 使用者邏輯 3: "只有在轉彎以及過轉彎後20公尺
+            // 會依據點雲對地圖匹配好的結果 來製作LOCALMAP ，並且會進行SCANMATCH (LO)"
+            if (use_temp_local_map) {
+              if (has_last_keyframe_ && !local_map->empty()) {
+                if (frontend_->scanMatch(cloud, local_map, local_pose,
+                                         fitness, true)) {
+                  double jump = (local_pose.block<3, 1>(0, 3) -
+                                 current_pose.block<3, 1>(0, 3))
+                                    .norm();
+                  if (jump < 1.0) {
+                    current_pose = local_pose; // 更新目前姿態為局部匹配結果，提供更準確的初始猜測給 HD Map
+                    local_match_success = true;
+                  }
+                }
+              } else {
+                // 初始化 Local Map
+                frontend_->clearLocalMap();
+                local_map->clear();
+                local_match_success = true;
+                has_last_keyframe_ = true;
+                last_keyframe_pose_ = current_pose;
+              }
+            } else {
+              // 非轉彎/緩衝期，嚴格清空 Local Map (不該點雲匹配的時候絕不出現 localmap)
+              if (has_last_keyframe_) {
+                frontend_->clearLocalMap();
+                local_map->clear();
+                has_last_keyframe_ = false;
+              }
+            }
+
+            // == 2. 全域匹配 (HD Map) ==
             if (periodic_update) {
               hd_match_count = 0;
-              Eigen::Matrix4f rescue_pose = current_pose;
+              Eigen::Matrix4f rescue_pose = current_pose; // 此為經過 Local Match (LO) 優化過的姿態
               if (frontend_->scanToHDMapMatch(cloud, rescue_pose, hd_fitness,
                                               is_turning)) {
                 ROS_INFO_THROTTLE(1.0, "[DEBUG] hd_fitness: %.2f.", hd_fitness);
@@ -700,7 +772,7 @@ private:
                 double lateral_jump = std::abs(delta_t_body.y());
 
                 if (hd_fitness < threshold && lateral_jump < 0.3) {
-                  current_pose = rescue_pose;
+                  current_pose = rescue_pose; // 以 HD Map 全域結果為最終姿態
                   hd_map_matched_this_frame = true;
                   hd_pose = rescue_pose;
                   has_hd_map_matched_ = true;
@@ -716,61 +788,6 @@ private:
                 }
               } else {
                 consecutive_hd_map_failures++;
-              }
-            }
-
-            // == 2. 局部匹配與建圖 (Local Map) ==
-            // 使用者邏輯 3: "只有在轉彎以及過轉彎後20公尺
-            // 會依據點雲對地圖匹配好的結果 來製作LOCALMAP ，並且會進行SCANMATCH
-            // (LO)"
-            if (use_temp_local_map) {
-              if (has_last_keyframe_ && !local_map->empty()) {
-                if (!hd_map_matched_this_frame) {
-                  // 只有在這一幀「沒有嘗試 HD Map 匹配」時，才進行局部匹配 (LO)
-                  // 如果是嘗試了 HD Map 匹配但失敗，則不進行局部匹配且不更新
-                  // Local Map
-                  if (!periodic_update) {
-                    if (frontend_->scanMatch(cloud, local_map, local_pose,
-                                             fitness, true)) {
-                      double jump = (local_pose.block<3, 1>(0, 3) -
-                                     current_pose.block<3, 1>(0, 3))
-                                        .norm();
-                      if (jump < 1.0) {
-                        current_pose = local_pose;
-                        local_match_success = true;
-                      }
-                    }
-                  } else {
-                    ROS_WARN_THROTTLE(
-                        1.0, "[HD Map] Match failed this frame. Skipping local "
-                             "map update to prevent corruption.");
-                  }
-                } else {
-                  // HD Map
-                  // 匹配成功，直接沿用其高精度結果，並允許後續將此點雲加入
-                  // Local Map
-                  local_match_success = true;
-                }
-              } else {
-                // 初始化 Local Map
-                if (hd_map_matched_this_frame || !periodic_update) {
-                  frontend_->clearLocalMap();
-                  local_map->clear();
-                  local_match_success = true;
-                  has_last_keyframe_ = true;
-                  last_keyframe_pose_ = current_pose;
-                } else {
-                  ROS_WARN_THROTTLE(1.0, "[HD Map] Match failed on initial "
-                                         "frame. Cannot initialize Local Map.");
-                }
-              }
-            } else {
-              // 非轉彎/緩衝期，嚴格清空 Local Map (不該點雲匹配的時候絕不出現
-              // localmap)
-              if (has_last_keyframe_) {
-                frontend_->clearLocalMap();
-                local_map->clear();
-                has_last_keyframe_ = false;
               }
             }
 

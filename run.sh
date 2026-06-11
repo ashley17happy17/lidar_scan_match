@@ -24,6 +24,3 @@ source devel/setup.bash
 # # Ensure we start with a clean slate
 # # Launch using roslaunch which will now use the injected <env> tags
 roslaunch lidar_scan_match_c run.launch
-
-
-cd ./src/lidar_scan_match_c

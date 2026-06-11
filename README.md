@@ -1,10 +1,99 @@
-# LIDAR Scan Match C++
+# LiDAR Scan Match C++
 
-# DOCKER
+## Docker
 
 ```
 # Build Docker
 bash ./docker/build_docker.sh
 # Run Docker
 bash ./docker/run_docker.sh
+```
+
+## Third Party
+- Create Third Party
+```
+cd /root/catkin_ws/src
+bash create_third_party.sh
+```
+- Update Third Party
+```
+cd /root/catkin_ws/src
+bash update_third_party.sh
+```
+
+## Build
+```
+bash build.sh
+```
+
+## Run
+```
+# Modify the run.sh and launch/run.launch
+# Modify the config/params.yaml file
+# Run the node
+bash run.sh
+```
+
+## Config
+```yaml
+## Lidar Scan Match ROS Parameters
+
+lidar_topic: "/points_raw" #"/ouster/points"          # sensor_msgs/PointCloud2
+gps_topic: "/gps/fix" #"/ublox_gps_node/fix"         # sensor_msgs/NavSatFix
+imu_topic: "/imu_combined"              # sensor_msgs/Imu
+
+# HD Map Settings
+hd_map_directory: "/root/catkin_ws/data/PH3_HDmap/map_tiles/" #"/root/data/map_tiles_v2"
+map_tile_size: 80.0                    # unit: meter
+
+# Extrinsics (IMU to Lidar)
+# IMU Frame: X-Front, Y-Left, Z-Up (Standard ROS Frame)
+extrinsicTrans: [1.0, -0.2, 0.45]        # unit: meter [x, y, z]
+extrinsicRot: [ 1.0, 0.0, 0.0,        # 3x3 Rotation Matrix (Row-major)
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0]
+
+# Extrinsics (IMU to GPS)
+extrinsicGpsTrans: [0.0, 0.0, 0.4]      # unit: meter [x, y, z]
+
+# IMU Preintegration Parameters
+# Unit: continuous time noise density
+imuAccNoise: 0.005886                 # unit: m/s^2 / sqrt(Hz)
+imuGyrNoise: 0.00087266               # unit: rad/s / sqrt(Hz)
+imuAccBiasN: 0.00186                  # unit: m/s^2 / s / sqrt(Hz) (Random Walk)
+imuGyrBiasN: 0.00007272               # unit: rad/s / s / sqrt(Hz) (Random Walk)
+imuGravity: 9.81007                    # unit: m/s^2
+
+# Point Downsample VoxelSize & Filtering
+leaf_size: 0.2                          # unit: meter (Voxel Grid Size)
+crop_min_bound: [10.0, 3.0, 1.8]        #unit: meter
+crop_max_bound: [60.0, 60.0, 30.0]      #unit: meter
+
+# Small-GICP
+icp_max_iterations: 100                 # unit: count
+icp_rotation_epsilon: 5e-3              # unit: rad
+icp_transformation_epsilon: 1e-2        # unit: meter
+icp_euclidean_fitness_epsilon: 1e-4     # unit: meter
+icp_max_dist_sq: 25.0                    # unit: meter^2 (Matching search radius squared)
+icp_num_threads: 15                     # unit: count
+lidar_rps: 10                           # unit: Hz (Lidar sensor frequency)
+hd_map_match_interval: 5                # unit: Hz (Target frequency for Scan-to-HDMap match)
+
+# Loop Closure
+loop_closure_enabled: true
+loop_closure_search_radius: 15.0        # unit: meter
+loop_closure_fitness_score: 0.5         # unitless (Lower is better)
+loop_closure_travel_distance: 30.0      # unit: meter
+
+# Robustness Thresholds
+gps_std_thres: 0.15                      # unit: meter (Minimum GPS precision to trigger factor)
+gps_cov_multiplier: 1.5                # unit: ratio (Inflate GPS noise to balance with Lidar)
+icp_max_acceptable_fitness_score: 2.0   # unitless (Discard matching above this error)
+max_single_frame_translation: 3.0       # unit: meter (Failsafe for IMU prediction jumps)
+max_single_frame_rotation: 0.5         # Max allowed rotation per frame (rad, ~28deg)
+
+# Output
+out_trajectory_path: "/root/catkin_ws/src/lidar_scan_match_c/output/lidar_trajectory_ph3_test1.csv"
+out_save: true                          # bool: whether to save CSV on exit
+out_hz: 10                              # unit: Hz (Trajectory recording frequency)
 ```

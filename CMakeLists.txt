@@ -58,6 +58,8 @@ include_directories(
   ${EIGEN3_INCLUDE_DIR}
 )
 
+add_subdirectory(third_party/lidar_utils_lib/src)
+
 # Library containing the main logic
 add_library(${PROJECT_NAME}_lib
   src/common.cpp
@@ -73,11 +75,13 @@ target_link_libraries(${PROJECT_NAME}_lib
   gtsam
   ${OpenCV_LIBRARIES}
   small_gicp
+  lidar_utils
 )
 
 # Node Executable
 add_executable(${PROJECT_NAME}_node src/lidar_slam_node.cpp)
-target_link_libraries(${PROJECT_NAME}_node
+target_link_libraries(
+  ${PROJECT_NAME}_node
   ${PROJECT_NAME}_lib
   ${catkin_LIBRARIES}
   ${PCL_LIBRARIES}
@@ -85,6 +89,7 @@ target_link_libraries(${PROJECT_NAME}_node
   gtsam
   ${OpenCV_LIBRARIES}
   small_gicp
+  lidar_utils
 )
 
 # Install rules (optional but good practice)

@@ -1,7 +1,9 @@
 #pragma once
 
 #include "common.h"
+#include <lidar_utils/cloud_utils.hpp>
 #include <pcl/filters/voxel_grid.h>
+#include <vector>
 
 namespace lidar_scan_match_c {
 
@@ -11,21 +13,13 @@ public:
 
   // Processes an incoming raw point cloud
   void processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
-                    CloudType::Ptr &out_cloud);
-
-  // Matches the MATLAB lidarPreprocess: denoising
-  void denoiseCloud(const CloudType::Ptr &in_cloud, CloudType::Ptr &out_cloud);
-
-  // Motion compensation (deskew)
-  void motionCompensate(const CloudType::Ptr &in_cloud,
-                        CloudType::Ptr &out_cloud);
+                    CloudType::Ptr &out_cloud,
+                    std::vector<double> &out_timestamps);
 
 private:
   double leaf_size_;
-  double crop_vehicle_x_;
-  double crop_vehicle_y_;
-  double crop_vehicle_z_;
-  pcl::VoxelGrid<PointType> downSizeFilter_;
+  Eigen::Vector3f crop_min_bound_;
+  Eigen::Vector3f crop_max_bound_;
 };
 
 } // namespace lidar_scan_match_c

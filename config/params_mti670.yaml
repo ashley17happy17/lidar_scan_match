@@ -28,8 +28,8 @@ imuGravity: 9.81007                    # unit: m/s^2
 
 # Point Downsample VoxelSize & Filtering
 leaf_size: 0.2                          # unit: meter (Voxel Grid Size)
-crop_vehicle_x: 1.5                     # unit: meter (Remove points within this distance longitudinally)
-crop_vehicle_y: 1.0                     # unit: meter (Remove points within this distance laterally)
+crop_min_bound: [10.0, 3.0, 1.8]        #unit: meter
+crop_max_bound: [60.0, 60.0, 30.0]      #unit: meter
 
 # Small-GICP
 icp_max_iterations: 100                 # unit: count

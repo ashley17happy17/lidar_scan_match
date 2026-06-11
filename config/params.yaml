@@ -5,7 +5,7 @@ gps_topic: "/gps/fix" #"/ublox_gps_node/fix"         # sensor_msgs/NavSatFix
 imu_topic: "/imu_combined"              # sensor_msgs/Imu
 
 # HD Map Settings
-hd_map_directory: "/root/data/PH3_HDmap/map_tiles/" #"/root/data/map_tiles_v2"
+hd_map_directory: "/root/catkin_ws/data/PH3_HDmap/map_tiles/" #"/root/data/map_tiles_v2"
 map_tile_size: 80.0                    # unit: meter
 
 # Extrinsics (IMU to Lidar)
@@ -28,9 +28,8 @@ imuGravity: 9.81007                    # unit: m/s^2
 
 # Point Downsample VoxelSize & Filtering
 leaf_size: 0.2                          # unit: meter (Voxel Grid Size)
-crop_vehicle_x: 10.0                     # unit: meter (Remove points within this distance longitudinally)
-crop_vehicle_y: 3.0                     # unit: meter (Remove points within this distance laterally)
-crop_vehicle_z: -1.8                    # unit: meter (Only remove points above this height relative to lidar to preserve ground points)
+crop_min_bound: [10.0, 3.0, 1.8]        #unit: meter
+crop_max_bound: [60.0, 60.0, 30.0]      #unit: meter
 
 # Small-GICP
 icp_max_iterations: 100                 # unit: count

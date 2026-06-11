@@ -21,8 +21,8 @@ services:
       # 掛載源碼：使用相對路徑，讓不同機器都能運作
       - ..:/root/catkin_ws/src/lidar_scan_match_c
       # 使用環境變數掛載外部依賴與資料，若未設定則留空或使用預設值
-      - ${HDMAP_PATH:-/tmp}:/root/catkin_ws/src/hdmap_regenerate
-      - ${DATA_PATH:-/tmp}:/root/data
+      - ${HDMAP_PATH:-/tmp}:/root/catkin_ws/hdmap_regenerate
+      - ${DATA_PATH:-/tmp}:/root/catkin_ws/data
     network_mode: "host"
     deploy:
       resources:

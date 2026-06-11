@@ -3,5 +3,4 @@ output/
 tmp/
 TODO.md
 .env
-.DS_Store
-*.swp
+third_party/
