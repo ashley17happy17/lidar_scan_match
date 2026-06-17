@@ -51,7 +51,7 @@ void SensorPreprocess::processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
   double base_unix_time = msg->header.stamp.toSec();
 
   for (const auto &pt : cloud_with_time.points) {
-    pcl::PointXYZI p;
+    lidar_utils::PointType p;
     p.x = pt.x;
     p.y = pt.y;
     p.z = pt.z;

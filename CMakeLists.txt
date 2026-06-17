@@ -30,6 +30,8 @@ find_package(GTSAM REQUIRED)
 find_package(OpenCV REQUIRED)
 # Find Eigen3
 find_package(Eigen3 REQUIRED)
+# Find PDAL
+find_package(PDAL REQUIRED)
 
 # Fetch small_gicp
 include(FetchContent)
@@ -74,6 +76,7 @@ target_link_libraries(${PROJECT_NAME}_lib
   ${CERES_LIBRARIES}
   gtsam
   ${OpenCV_LIBRARIES}
+  ${PDAL_LIBRARIES} 
   small_gicp
   lidar_utils
 )
@@ -88,6 +91,7 @@ target_link_libraries(
   ${CERES_LIBRARIES}
   gtsam
   ${OpenCV_LIBRARIES}
+  ${PDAL_LIBRARIES} 
   small_gicp
   lidar_utils
 )

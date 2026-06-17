@@ -722,16 +722,19 @@ private:
 
             // == 1. 局部匹配與建圖 (Local Map) ==
             // 使用者邏輯 3: "只有在轉彎以及過轉彎後20公尺
-            // 會依據點雲對地圖匹配好的結果 來製作LOCALMAP ，並且會進行SCANMATCH (LO)"
+            // 會依據點雲對地圖匹配好的結果 來製作LOCALMAP ，並且會進行SCANMATCH
+            // (LO)"
             if (use_temp_local_map) {
               if (has_last_keyframe_ && !local_map->empty()) {
-                if (frontend_->scanMatch(cloud, local_map, local_pose,
-                                         fitness, true)) {
+                if (frontend_->scanMatch(cloud, local_map, local_pose, fitness,
+                                         true)) {
                   double jump = (local_pose.block<3, 1>(0, 3) -
                                  current_pose.block<3, 1>(0, 3))
                                     .norm();
                   if (jump < 1.0) {
-                    current_pose = local_pose; // 更新目前姿態為局部匹配結果，提供更準確的初始猜測給 HD Map
+                    current_pose =
+                        local_pose; // 更新目前姿態為局部匹配結果，提供更準確的初始猜測給
+                                    // HD Map
                     local_match_success = true;
                   }
                 }
@@ -744,7 +747,8 @@ private:
                 last_keyframe_pose_ = current_pose;
               }
             } else {
-              // 非轉彎/緩衝期，嚴格清空 Local Map (不該點雲匹配的時候絕不出現 localmap)
+              // 非轉彎/緩衝期，嚴格清空 Local Map (不該點雲匹配的時候絕不出現
+              // localmap)
               if (has_last_keyframe_) {
                 frontend_->clearLocalMap();
                 local_map->clear();
@@ -755,7 +759,8 @@ private:
             // == 2. 全域匹配 (HD Map) ==
             if (periodic_update) {
               hd_match_count = 0;
-              Eigen::Matrix4f rescue_pose = current_pose; // 此為經過 Local Match (LO) 優化過的姿態
+              Eigen::Matrix4f rescue_pose =
+                  current_pose; // 此為經過 Local Match (LO) 優化過的姿態
               if (frontend_->scanToHDMapMatch(cloud, rescue_pose, hd_fitness,
                                               is_turning)) {
                 ROS_INFO_THROTTLE(1.0, "[DEBUG] hd_fitness: %.2f.", hd_fitness);
