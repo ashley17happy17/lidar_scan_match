@@ -5,17 +5,17 @@
 // Define a struct that EXACTLY matches your bag file's fields!
 struct OusterPoint {
   PCL_ADD_POINT4D; // x, y, z
-  float intensity;
+  float reflectivity;
   uint32_t t;    // Datatype 6 is uint32
   uint16_t ring; // Datatype 4 is uint16
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 } EIGEN_ALIGN16;
 
-POINT_CLOUD_REGISTER_POINT_STRUCT(
-    OusterPoint,
-    (float, x, x)(float, y, y)(float, z, z)(float, intensity,
-                                            intensity)(uint32_t, t,
-                                                       t)(uint16_t, ring, ring))
+POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPoint,
+                                  (float, x, x)(float, y, y)(float, z, z)(
+                                      float, reflectivity,
+                                      reflectivity)(uint32_t, t, t)(uint16_t,
+                                                                    ring, ring))
 
 namespace lidar_scan_match_c {
 
@@ -55,7 +55,7 @@ void SensorPreprocess::processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
     p.x = pt.x;
     p.y = pt.y;
     p.z = pt.z;
-    p.intensity = pt.intensity;
+    p.intensity = pt.reflectivity;
     raw_cloud->push_back(p);
 
     // Ouster's 't' field is the RELATIVE offset in nanoseconds from the start
