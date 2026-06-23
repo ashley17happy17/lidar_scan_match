@@ -126,7 +126,7 @@ private:
                 filename.c_str());
       return;
     }
-    f << "time,lat,lon,h,twd97x,twd97y,twd97z,roll_deg,pitch_deg,yaw_deg\n";
+    f << "time,lat,lon,h,twd97x,twd97y,twd97z,roll_rad,pitch_rad,yaw_rad\n";
     f << std::fixed << std::setprecision(8);
     for (const auto &p : recorded_trajectory_) {
       f << p.time << "," << p.lat << "," << p.lon << "," << p.h << "," << p.twdx
@@ -1259,19 +1259,18 @@ private:
         double sinr_cosp = 2 * (q_veh.w() * q_veh.x() + q_veh.y() * q_veh.z());
         double cosr_cosp =
             1 - 2 * (q_veh.x() * q_veh.x() + q_veh.y() * q_veh.y());
-        tp.roll = std::atan2(sinr_cosp, cosr_cosp) * 180.0 / M_PI;
+        tp.roll = std::atan2(sinr_cosp, cosr_cosp);
 
         double sinp = 2 * (q_veh.w() * q_veh.y() - q_veh.z() * q_veh.x());
         if (std::abs(sinp) >= 1)
-          tp.pitch = std::copysign(M_PI / 2, sinp) * 180.0 / M_PI;
+          tp.pitch = std::copysign(M_PI / 2, sinp);
         else
-          tp.pitch = std::asin(sinp) * 180.0 / M_PI;
+          tp.pitch = std::asin(sinp);
 
         // Calculate Heading (Yaw) using the VEHICLE'S forward vector
         Eigen::Vector3f veh_forward_in_map =
             T_map_imu.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
-        tp.yaw = std::atan2(veh_forward_in_map.x(), veh_forward_in_map.y()) *
-                 180.0 / M_PI;
+        tp.yaw = std::atan2(veh_forward_in_map.x(), veh_forward_in_map.y());
 
         recorded_trajectory_.push_back(tp);
       }
