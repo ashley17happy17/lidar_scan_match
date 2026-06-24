@@ -1,4 +1,4 @@
-#include "back_end_optimization.hpp"
+#include "lidar_scan_match_c/back_end_optimization.hpp"
 #include <gtsam/inference/Symbol.h>
 
 using gtsam::symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)

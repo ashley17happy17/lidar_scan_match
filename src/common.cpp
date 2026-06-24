@@ -1,4 +1,4 @@
-#include "common.h"
+#include "lidar_scan_match_c/common.h"
 #include <cmath>
 
 namespace lidar_scan_match_c {

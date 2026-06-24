@@ -9,9 +9,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <visualization_msgs/MarkerArray.h>
 
-#include "back_end_optimization.hpp"
-#include "front_end_icp.hpp"
-#include "sensor_preprocess.hpp"
+#include "lidar_scan_match_c/back_end_optimization.hpp"
+#include "lidar_scan_match_c/front_end_icp.hpp"
+#include "lidar_scan_match_c/sensor_preprocess.hpp"
 
 #include <pcl/common/common.h>
 #include <pcl/common/transforms.h>
