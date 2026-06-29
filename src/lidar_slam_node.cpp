@@ -223,11 +223,12 @@ private:
                           return a.offset_x < b.offset_x;
                         });
             } else {
-              ROS_WARN("[MapLoader] HD map directory does not exist: %s",
+              ROS_WARN("[WARN] MapLoader: HD map directory does not exist: %s",
                        hd_map_dir.c_str());
             }
           } catch (const std::exception &e) {
-            ROS_ERROR("[MapLoader] Error reading map directory: %s", e.what());
+            ROS_ERROR("[ERROR] MapLoader: Error reading map directory: %s",
+                      e.what());
           }
         }
 
@@ -245,7 +246,7 @@ private:
                   (tile_info.offset_z - map_origin_twd97_.z());
               pcl::transformPointCloud(*tile, *tile, T);
               *merged_tiles += *tile;
-              ROS_INFO("map loaded.\n");
+              // ROS_INFO("map loaded.\n");
             }
           }
         }
@@ -257,7 +258,7 @@ private:
           // Optimized for real-time: Downsample the HD map to 0.5m density
           CloudType::Ptr optimized_map(new CloudType());
           pcl::VoxelGrid<PointType> vg;
-          vg.setLeafSize(0.5f, 0.5f, 0.5f);
+          vg.setLeafSize(0.2f, 0.2f, 0.2f);
           vg.setInputCloud(merged_tiles);
           vg.filter(*optimized_map);
 
@@ -336,10 +337,6 @@ private:
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         continue;
       }
-      if (buf_size > 2) {
-        ROS_WARN_THROTTLE(
-            1.0, "[Offline] Catching up... Lidar Buffer Size: %zu", buf_size);
-      }
       auto t_loop_start = std::chrono::steady_clock::now();
 
       double lidar_time = lidar_msg->header.stamp.toSec();
@@ -359,14 +356,21 @@ private:
           Eigen::Quaternionf q(imu->orientation.w, imu->orientation.x,
                                imu->orientation.y, imu->orientation.z);
           if (q.norm() > 0.1) {
-            double yaw_imu = atan2(2.0 * (q.w() * q.z() + q.x() * q.y()),
-                                   1.0 - 2.0 * (q.y() * q.y() + q.z() * q.z()));
+            Eigen::Matrix3f R_imu = q.toRotationMatrix();
+            Eigen::Vector3f euler =
+                R_imu.eulerAngles(2, 1, 0); // Yaw, Pitch, Roll
+            double yaw_imu = euler[0];
+            double pitch_imu = euler[1];
+            double roll_imu = euler[2];
+
             // Align North-Up IMU (0) to ENU Y-axis (90)
             double yaw_enu = -yaw_imu + (M_PI / 2.0);
 
             Eigen::Matrix4f T_world = Eigen::Matrix4f::Identity();
             T_world.block<3, 3>(0, 0) =
-                Eigen::AngleAxisf(yaw_enu, Eigen::Vector3f::UnitZ())
+                (Eigen::AngleAxisf(yaw_enu, Eigen::Vector3f::UnitZ()) *
+                 Eigen::AngleAxisf(pitch_imu, Eigen::Vector3f::UnitY()) *
+                 Eigen::AngleAxisf(roll_imu, Eigen::Vector3f::UnitX()))
                     .toRotationMatrix();
             current_pose =
                 T_world * backend_->getExtrinsic().matrix().cast<float>();
@@ -465,19 +469,20 @@ private:
 
               if (currently_within_hd_bounds &&
                   consecutive_hd_map_failures >= 3) {
-                ROS_WARN_THROTTLE(1.0, "[GPS] HD Map failed >= 3 times! "
+                ROS_WARN_THROTTLE(1.0, "[INFO] GPS: HD Map failed >= 3 times! "
                                        "Fallback to RTK GNSS injected!");
               } else if (!has_hd_map_matched_) {
                 ROS_INFO_THROTTLE(2.0,
-                                  "[GPS] Pre-Match: Trusting RTK GPS tightly "
+                                  "[INFO] GPS: Trusting RTK GPS tightly "
                                   "for initialization! "
                                   "2DStdDev: %.2fm",
                                   cov_h);
               } else {
-                ROS_INFO_THROTTLE(1.0,
-                                  "[GPS] RTK High-Precision GPS injected! "
-                                  "2DStdDev: %.2fm (Weight Multiplier: %.1f)",
-                                  cov_h, gps_cov_multiplier_);
+                ROS_INFO_THROTTLE(
+                    1.0,
+                    "[INFO] GPS: RTK High-Precision GPS injected! "
+                    "2DStdDev: %.2fm (Weight Multiplier: %.1f)",
+                    cov_h, gps_cov_multiplier_);
               }
             } else {
               // IN HD MAP: Inject GNSS with a massive covariance (10.0m std dev
@@ -555,7 +560,6 @@ private:
           // ==== MOTION COMPENSATION ====
           if (!is_first_lidar_frame && !timestamps.empty() &&
               prev_reg_time_ > 0) {
-            auto t_mc_start = std::chrono::high_resolution_clock::now();
 
             auto poseToVector = [](double time, const Eigen::Matrix4f &pose) {
               Eigen::VectorXd vec(7);
@@ -582,12 +586,6 @@ private:
             // Revert the cloud from global frame back to lidar frame, as
             // scanToHDmap will input the init_guess pose itself
             pcl::transformPointCloud(*cloud, *cloud, predicted_pose.inverse());
-
-            auto t_mc_end = std::chrono::high_resolution_clock::now();
-            ROS_INFO_THROTTLE(
-                1.0, "[BackEnd] Time - Motion Compensation: %.2f ms",
-                std::chrono::duration<double, std::milli>(t_mc_end - t_mc_start)
-                    .count());
           }
 
           bool scan_match_failed = false;
@@ -600,7 +598,6 @@ private:
           bool should_skip_frame = false;
           currently_within_hd_bounds = false;
           bool local_match_success = false;
-          bool use_temp_local_map = false;
 
           // --- Update current_pose with prediction ---
           if (predict_jump < max_trans_jump_ && predict_angle < max_rot_jump_) {
@@ -654,10 +651,10 @@ private:
             prev_pose_for_turn = current_pose;
           }
 
-          // --- Extended Local Map tracking (Keep for 20m after turn) ---
+          // --- Extended Turn Tracking (Keep continuous HD Map for 10m after
+          // turn) ---
           static bool was_turning_extended = false;
           static Eigen::Vector3f turn_end_pos = Eigen::Vector3f::Zero();
-          use_temp_local_map = is_turning;
 
           if (is_turning) {
             was_turning_extended = true;
@@ -665,12 +662,10 @@ private:
           } else if (was_turning_extended) {
             double dist_since_turn =
                 (current_pose.block<3, 1>(0, 3) - turn_end_pos).norm();
-            if (dist_since_turn < 20.0) {
-              use_temp_local_map = true;
-            } else {
+            if (dist_since_turn >= 10.0) {
               was_turning_extended = false;
-              ROS_INFO("[Local Map] 20 meters reached since turn ended. Ready "
-                       "to clear temporary local map.");
+              ROS_INFO("[HD Map] Post-turn 10m threshold reached. Returning to "
+                       "periodic updates.");
             }
           }
 
@@ -720,49 +715,28 @@ private:
             }
             was_in_hd_map = true;
 
-            // == 1. 局部匹配與建圖 (Local Map) ==
-            // 使用者邏輯 3: "只有在轉彎以及過轉彎後20公尺
-            // 會依據點雲對地圖匹配好的結果 來製作LOCALMAP ，並且會進行SCANMATCH
-            // (LO)"
-            if (use_temp_local_map) {
-              if (has_last_keyframe_ && !local_map->empty()) {
-                if (frontend_->scanMatch(cloud, local_map, local_pose, fitness,
-                                         true)) {
-                  double jump = (local_pose.block<3, 1>(0, 3) -
-                                 current_pose.block<3, 1>(0, 3))
-                                    .norm();
-                  if (jump < 1.0) {
-                    current_pose =
-                        local_pose; // 更新目前姿態為局部匹配結果，提供更準確的初始猜測給
-                                    // HD Map
-                    local_match_success = true;
-                  }
-                }
-              } else {
-                // 初始化 Local Map
-                frontend_->clearLocalMap();
-                local_map->clear();
-                local_match_success = true;
-                has_last_keyframe_ = true;
-                last_keyframe_pose_ = current_pose;
-              }
-            } else {
-              // 非轉彎/緩衝期，嚴格清空 Local Map (不該點雲匹配的時候絕不出現
-              // localmap)
-              if (has_last_keyframe_) {
-                frontend_->clearLocalMap();
-                local_map->clear();
-                has_last_keyframe_ = false;
-              }
+            if (is_turning || was_turning_extended) {
+              periodic_update = true;
             }
 
-            // == 2. 全域匹配 (HD Map) ==
+            // 清空 Local Map：一旦進入 HD Map 範圍，就不再需要 Local
+            // Map，應立即清空以避免在 RViz 殘留
+            if (has_last_keyframe_) {
+              frontend_->clearLocalMap();
+              local_map->clear();
+              has_last_keyframe_ = false;
+            }
+
+            // == 1. 全域匹配 (HD Map) ==
             if (periodic_update) {
               hd_match_count = 0;
-              Eigen::Matrix4f rescue_pose =
-                  current_pose; // 此為經過 Local Match (LO) 優化過的姿態
+              // CRITICAL FIX: Always use pure IMU predicted_pose as the initial
+              // guess for HD Map! If we use current_pose here, any slip/drift
+              // from the Local Map will corrupt the HD Map guess!
+              Eigen::Matrix4f rescue_pose = predicted_pose;
+              bool is_init = !has_hd_map_matched_;
               if (frontend_->scanToHDMapMatch(cloud, rescue_pose, hd_fitness,
-                                              is_turning)) {
+                                              is_turning, is_init)) {
                 ROS_INFO_THROTTLE(1.0, "[DEBUG] hd_fitness: %.2f.", hd_fitness);
 
                 // 放寬轉彎時的接受標準，因為運動模糊可能會讓 fitness 稍微增加
@@ -776,7 +750,22 @@ private:
                                           predicted_pose.block<3, 1>(0, 3));
                 double lateral_jump = std::abs(delta_t_body.y());
 
-                if (hd_fitness < threshold && lateral_jump < 0.3) {
+                if (hd_fitness < threshold && lateral_jump < 10.0) {
+                  // If HD Map pulled the pose by more than 0.5m, the Local Map
+                  // is internally distorted (ghosted). Clear it!
+                  double correction_jump = (rescue_pose.block<3, 1>(0, 3) -
+                                            current_pose.block<3, 1>(0, 3))
+                                               .norm();
+                  if (correction_jump > 0.5) {
+                    ROS_WARN_THROTTLE(
+                        1.0,
+                        "[WARN] Local Map: HD Map correction %.2fm is "
+                        "large. Clearing distorted Local Map!",
+                        correction_jump);
+                    frontend_->clearLocalMap();
+                    local_map->clear();
+                  }
+
                   current_pose = rescue_pose; // 以 HD Map 全域結果為最終姿態
                   hd_map_matched_this_frame = true;
                   hd_pose = rescue_pose;
@@ -784,10 +773,10 @@ private:
                   consecutive_hd_map_failures = 0;
                 } else {
                   consecutive_hd_map_failures++;
-                  if (hd_fitness < threshold && lateral_jump >= 0.3) {
+                  if (hd_fitness < threshold && lateral_jump >= 10.0) {
                     ROS_WARN_THROTTLE(1.0,
                                       "[HD Map] Match rejected due to large "
-                                      "lateral jump: %.2fm >= 0.3m",
+                                      "lateral jump: %.2fm >= 10.0m",
                                       lateral_jump);
                   }
                 }
@@ -818,18 +807,19 @@ private:
                 if (jump < 1.0) {
                   current_pose =
                       local_pose; // 永遠採信 Lidar Odometry 避免 IMU 預測失控
-                  if (fitness < local_threshold) {
-                    local_match_success = true;
-                  } else {
+                  local_match_success = true;
+
+                  if (fitness >= local_threshold) {
                     ROS_WARN_THROTTLE(
                         1.0,
-                        "[Local Map] High fitness %.2f > %.2f. Pose updated, "
-                        "but cloud NOT added to map.",
+                        "[WARN] Local Map: High fitness %.2f > %.2f, "
+                        "but map growth is allowed.",
                         fitness, local_threshold);
                   }
                 } else {
                   ROS_WARN_THROTTLE(
-                      1.0, "[Local Map] Rejected match: jump=%.2fm > 1.0m",
+                      1.0,
+                      "[WARN] Local Map: Rejected match: jump=%.2fm > 1.0m",
                       jump);
                 }
               }
@@ -842,14 +832,16 @@ private:
               local_match_success = true;
               has_last_keyframe_ = true;
               last_keyframe_pose_ = current_pose;
-              ROS_INFO("[Local Map] Creating new local map anchor outside HD "
-                       "Map.");
+              ROS_INFO(
+                  "[INFO] Local Map: Creating new local map anchor outside HD "
+                  "Map.");
             }
 
             if (!local_match_success) {
               should_skip_frame = true;
               ROS_WARN_THROTTLE(
-                  1.0, "[Failsafe] Local match failed. Using IMU prediction.");
+                  1.0,
+                  "[WARN] Failsafe: Local match failed. Using IMU prediction.");
             } else {
               should_skip_frame = false;
             }
@@ -897,9 +889,10 @@ private:
           } else {
             static_frame_count = 0;
             if (was_zupt_locked) {
-              ROS_INFO("[ZUPT] Vehicle started moving (GNSS Speed: %.2f). "
-                       "Breaking lock!",
-                       current_gps_speed);
+              ROS_INFO(
+                  "[INFO] ZUPT: Vehicle started moving (GNSS Speed: %.2f). "
+                  "Breaking lock!",
+                  current_gps_speed);
               was_zupt_locked = false;
             }
           }
@@ -909,9 +902,8 @@ private:
             current_pose = last_process_pose; // 凍結當前位姿，防止點雲抖動
             backend_->addZUPTFactor();        // 告訴後端優化器目前速度為 0
             was_zupt_locked = true;
-            ROS_INFO_THROTTLE(
-                2.0,
-                "[ZUPT] Vehicle is stationary. Applying Zero Velocity Update.");
+            ROS_INFO_THROTTLE(2.0, "[INFO] ZUPT: Vehicle is stationary. "
+                                   "Applying Zero Velocity Update.");
           }
           last_process_pose = current_pose;
           // ---------------------------------------------
@@ -956,8 +948,7 @@ private:
           // "批配成功的點雲才能製作localmap"
           // 當我們在 HD Map 外，或在 HD Map
           // 內但處於轉彎及20m緩衝期時，將點雲加入 Local Map 進行延伸
-          if ((!currently_within_hd_bounds || use_temp_local_map) &&
-              local_match_success) {
+          if (!currently_within_hd_bounds && local_match_success) {
             if (!has_last_keyframe_) {
               last_keyframe_pose_ = current_pose;
               has_last_keyframe_ = true;
@@ -974,6 +965,7 @@ private:
                 Eigen::AngleAxisf(R_curr * R_last.transpose()).angle());
 
             if (dist > 1.0 || angle > 0.2 || !frontend_->hasKeyframes()) {
+              ROS_INFO("[DEBUG] Adding keyframe! dist: %.2f, angle: %.2f", dist, angle);
               frontend_->addKeyframeCloud(cloud, current_pose);
               last_keyframe_pose_ = current_pose;
 
@@ -995,7 +987,11 @@ private:
             }
 
             // 7. 更新 Local Map 用於下一幀匹配與發布
+            static double last_local_map_build_time = -1.0;
+            // Force map generation every frame by removing the 0.1s check to avoid float precision bugs
             frontend_->getLocalMap(local_map);
+            ROS_INFO_THROTTLE(1.0, "[DEBUG] getLocalMap built! keyframes: %ld, local_map points: %ld", 
+                              frontend_->getKeyframesSize(), local_map->size());
           }
           latest_pose_ = current_pose;
         } else {
@@ -1020,10 +1016,10 @@ private:
         // redundant stamps)
         static double last_published_lidar_time = -1.0;
         if (lidar_time > last_published_lidar_time) {
-          // 在發布前重新獲取一次 Local Map，確保最新加入的 Keyframe
-          // 也能立即顯示
-          frontend_->getLocalMap(local_map);
-          publishData(lidar_time, current_pose, cloud, local_map);
+          // Local map is now built at a specific timegap (0.5s) earlier in the
+          // loop. We directly use the cached local_map here instead of
+          publishData(lidar_time, current_pose, cloud, local_map,
+                      currently_within_hd_bounds);
           last_published_lidar_time = lidar_time;
         }
         latest_pose_ = current_pose;
@@ -1044,9 +1040,16 @@ private:
         double total_ms =
             std::chrono::duration<double, std::milli>(t_loop_end - t_loop_start)
                 .count();
-        ROS_INFO_THROTTLE(2.0,
-                          "[Realtime] Total Latency: %.1f ms (Buffer: %zu)",
-                          total_ms, buf_size);
+
+        if (buf_size > 2) {
+          ROS_WARN_THROTTLE(
+              1.0, "[WARN] Offline: catching up... Lidar Buffer Size: %zu",
+              buf_size);
+        } else {
+          ROS_INFO_THROTTLE(
+              2.0, "[INFO] Realtime: total Latency: %.1f ms (Buffer: %zu)",
+              total_ms, buf_size);
+        }
       } catch (std::exception &e) {
         ROS_ERROR("Exception: %s", e.what());
       }
@@ -1148,13 +1151,25 @@ private:
   }
 
   void publishData(double ts, const Eigen::Matrix4f &pose,
-                   const CloudType::Ptr &cloud,
-                   const CloudType::Ptr &local_map) {
+                   const CloudType::Ptr &cloud, const CloudType::Ptr &local_map,
+                   bool currently_within_hd_bounds) {
     // 只有在 HD Map
     // 已經加載且點雲成功對地圖完成第一次匹配後，才允許發布任何資料 (包含
     // TF、點雲與里程計) 這能完全避免在匹配成功前，RViz
     // 畫面上先顯示錯誤坐標的點雲與軌跡，消除瞬間巨大跳變！
-    if (!first_map_check_done_ || !has_hd_map_matched_) {
+    if (!first_map_check_done_) {
+      return;
+    }
+
+    // 若尚未匹配 HD Map，但車輛根本不在 HD Map 範圍內，則允許發布 Local Map
+    // 與軌跡 (純粹依賴 GPS/IMU) 這樣在無地圖區域起步時，使用者依然能看到 Local
+    // Map 不斷生成與更新
+    static bool allow_publishing = false;
+    if (has_hd_map_matched_ || !currently_within_hd_bounds) {
+      allow_publishing = true;
+    }
+
+    if (!allow_publishing) {
       return;
     }
 

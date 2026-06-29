@@ -31,7 +31,7 @@ public:
   // HD Map matching
   bool scanToHDMapMatch(const CloudType::Ptr &current_cloud,
                         Eigen::Matrix4f &out_transform,
-                        double &out_fitness_score, bool is_turning = false);
+                        double &out_fitness_score, bool is_turning = false, bool is_initialization = false);
 
   // Loop closure specific functions
   void addKeyframeCloud(const CloudType::Ptr &cloud,
@@ -40,6 +40,7 @@ public:
   void shiftLocalMap(const Eigen::Matrix4f &delta_transform);
   void clearLocalMap();
   bool hasKeyframes() const { return !keyframe_clouds_.empty(); }
+  size_t getKeyframesSize() const { return keyframe_clouds_.size(); }
   int getKeyframeCount() const { return keyframe_clouds_.size(); }
   bool detectLoopClosure(const Eigen::Matrix4f &current_pose,
                          double search_radius, int &out_loop_index,

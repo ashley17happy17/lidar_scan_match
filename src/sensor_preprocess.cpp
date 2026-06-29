@@ -2,20 +2,7 @@
 #include <chrono>
 #include <lidar_utils/types.hpp>
 
-// Define a struct that EXACTLY matches your bag file's fields!
-struct OusterPoint {
-  PCL_ADD_POINT4D; // x, y, z
-  float reflectivity;
-  uint32_t t;    // Datatype 6 is uint32
-  uint16_t ring; // Datatype 4 is uint16
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-} EIGEN_ALIGN16;
-
-POINT_CLOUD_REGISTER_POINT_STRUCT(OusterPoint,
-                                  (float, x, x)(float, y, y)(float, z, z)(
-                                      float, reflectivity,
-                                      reflectivity)(uint32_t, t, t)(uint16_t,
-                                                                    ring, ring))
+#include <sensor_msgs/point_cloud2_iterator.h>
 
 namespace lidar_scan_match_c {
 
@@ -39,37 +26,130 @@ void SensorPreprocess::processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
                                     CloudType::Ptr &out_cloud,
                                     std::vector<double> &out_timestamps) {
   CloudType::Ptr raw_cloud(new CloudType());
-
-  pcl::PointCloud<OusterPoint> cloud_with_time;
-  pcl::fromROSMsg(*msg, cloud_with_time);
-
   std::vector<double> timestamps;
-  raw_cloud->reserve(cloud_with_time.size());
-  timestamps.reserve(cloud_with_time.size());
+  size_t num_points = msg->width * msg->height;
+  raw_cloud->reserve(num_points);
+  timestamps.reserve(num_points);
 
-  // Get the base unix time of the entire scan from the ROS message header
   double base_unix_time = msg->header.stamp.toSec();
 
-  for (const auto &pt : cloud_with_time.points) {
-    lidar_utils::PointType p;
-    p.x = pt.x;
-    p.y = pt.y;
-    p.z = pt.z;
-    p.intensity = pt.reflectivity;
-    raw_cloud->push_back(p);
+  sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
 
-    // Ouster's 't' field is the RELATIVE offset in nanoseconds from the start
-    // of the scan! To get the absolute Unix time, we must add the
-    // base_unix_time.
-    double point_unix_time = base_unix_time + (static_cast<double>(pt.t) / 1e9);
-    timestamps.push_back(point_unix_time);
+  // 1. Extract X, Y, Z
+  for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
+    lidar_utils::PointType p;
+    p.x = *iter_x;
+    p.y = *iter_y;
+    p.z = *iter_z;
+    p.intensity = 0.0f; // Default intensity
+    raw_cloud->push_back(p);
   }
 
-  if (!timestamps.empty()) {
-    // Just print the first one! Printing 130,000 points will crash your
-    // terminal!
-    ROS_INFO_THROTTLE(1.0, "[BackEnd] Base time: %.6f, Second point_time: %.6f",
-                      base_unix_time, timestamps[1]);
+  // 2. Extract Intensity or Reflectivity
+  bool has_intensity = false, has_reflectivity = false;
+  int intensity_type = 0, reflectivity_type = 0;
+  for (const auto &f : msg->fields) {
+    if (f.name == "intensity") {
+      has_intensity = true;
+      intensity_type = f.datatype;
+    }
+    if (f.name == "reflectivity") {
+      has_reflectivity = true;
+      reflectivity_type = f.datatype;
+    }
+  }
+
+  if (has_intensity) {
+    if (intensity_type == sensor_msgs::PointField::FLOAT32) {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_i(*msg, "intensity");
+      for (size_t i = 0; i < num_points && iter_i != iter_i.end();
+           ++i, ++iter_i)
+        raw_cloud->points[i].intensity = *iter_i;
+    } else if (intensity_type == sensor_msgs::PointField::UINT16) {
+      sensor_msgs::PointCloud2ConstIterator<uint16_t> iter_i(*msg, "intensity");
+      for (size_t i = 0; i < num_points && iter_i != iter_i.end();
+           ++i, ++iter_i)
+        raw_cloud->points[i].intensity = static_cast<float>(*iter_i);
+    } else if (intensity_type == sensor_msgs::PointField::UINT8) {
+      sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_i(*msg, "intensity");
+      for (size_t i = 0; i < num_points && iter_i != iter_i.end();
+           ++i, ++iter_i)
+        raw_cloud->points[i].intensity = static_cast<float>(*iter_i);
+    }
+  } else if (has_reflectivity) {
+    if (reflectivity_type == sensor_msgs::PointField::FLOAT32) {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_r(*msg, "reflectivity");
+      for (size_t i = 0; i < num_points && iter_r != iter_r.end();
+           ++i, ++iter_r)
+        raw_cloud->points[i].intensity = *iter_r;
+    } else if (reflectivity_type == sensor_msgs::PointField::UINT16) {
+      sensor_msgs::PointCloud2ConstIterator<uint16_t> iter_r(*msg,
+                                                             "reflectivity");
+      for (size_t i = 0; i < num_points && iter_r != iter_r.end();
+           ++i, ++iter_r)
+        raw_cloud->points[i].intensity = static_cast<float>(*iter_r);
+    } else if (reflectivity_type == sensor_msgs::PointField::UINT8) {
+      sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_r(*msg,
+                                                            "reflectivity");
+      for (size_t i = 0; i < num_points && iter_r != iter_r.end();
+           ++i, ++iter_r)
+        raw_cloud->points[i].intensity = static_cast<float>(*iter_r);
+    }
+  }
+
+  // 3. Extract Timestamps
+  bool has_time = false, has_t = false;
+  int time_type = 0, t_type = 0;
+  for (const auto &f : msg->fields) {
+    if (f.name == "time") {
+      has_time = true;
+      time_type = f.datatype;
+    }
+    if (f.name == "t") {
+      has_t = true;
+      t_type = f.datatype;
+    }
+  }
+
+  if (has_time) {
+    // Velodyne typically uses 'time' (float or double, in seconds relative to
+    // scan)
+    if (time_type == sensor_msgs::PointField::FLOAT64) {
+      sensor_msgs::PointCloud2ConstIterator<double> iter_t(*msg, "time");
+      for (size_t i = 0; i < num_points && iter_t != iter_t.end();
+           ++i, ++iter_t)
+        timestamps.push_back(base_unix_time + *iter_t);
+    } else if (time_type == sensor_msgs::PointField::FLOAT32) {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_t(*msg, "time");
+      for (size_t i = 0; i < num_points && iter_t != iter_t.end();
+           ++i, ++iter_t)
+        timestamps.push_back(base_unix_time + static_cast<double>(*iter_t));
+    }
+  } else if (has_t) {
+    // Ouster typically uses 't' (uint32, in nanoseconds)
+    if (t_type == sensor_msgs::PointField::UINT32) {
+      sensor_msgs::PointCloud2ConstIterator<uint32_t> iter_t(*msg, "t");
+      for (size_t i = 0; i < num_points && iter_t != iter_t.end();
+           ++i, ++iter_t)
+        timestamps.push_back(base_unix_time +
+                             static_cast<double>(*iter_t) / 1e9);
+    } else if (t_type == sensor_msgs::PointField::FLOAT64) {
+      sensor_msgs::PointCloud2ConstIterator<double> iter_t(*msg, "t");
+      for (size_t i = 0; i < num_points && iter_t != iter_t.end();
+           ++i, ++iter_t)
+        timestamps.push_back(base_unix_time + *iter_t);
+    } else if (t_type == sensor_msgs::PointField::FLOAT32) {
+      sensor_msgs::PointCloud2ConstIterator<float> iter_t(*msg, "t");
+      for (size_t i = 0; i < num_points && iter_t != iter_t.end();
+           ++i, ++iter_t)
+        timestamps.push_back(base_unix_time + static_cast<double>(*iter_t));
+    }
+  } else {
+    // Fallback if no valid time field exists
+    for (size_t i = 0; i < num_points; ++i)
+      timestamps.push_back(base_unix_time);
   }
 
   auto t1 = std::chrono::high_resolution_clock::now();
@@ -96,13 +176,15 @@ void SensorPreprocess::processCloud(const sensor_msgs::PointCloud2ConstPtr &msg,
 
   auto t5 = std::chrono::high_resolution_clock::now();
 
-  ROS_INFO_THROTTLE(1.0,
-                    "[BackEnd] Time - Crop: %.2f ms, Denoise: %.2f ms, "
-                    "Artifact: %.2f ms, Downsample: %.2f ms",
-                    std::chrono::duration<double, std::milli>(t2 - t1).count(),
-                    std::chrono::duration<double, std::milli>(t3 - t2).count(),
-                    std::chrono::duration<double, std::milli>(t4 - t3).count(),
-                    std::chrono::duration<double, std::milli>(t5 - t4).count());
+  // ROS_INFO_THROTTLE(1.0,
+  //                   "[BackEnd] Time - Crop: %.2f ms, Denoise: %.2f ms, "
+  //                   "Artifact: %.2f ms, Downsample: %.2f ms",
+  //                   std::chrono::duration<double, std::milli>(t2 -
+  //                   t1).count(), std::chrono::duration<double, std::milli>(t3
+  //                   - t2).count(), std::chrono::duration<double,
+  //                   std::milli>(t4 - t3).count(),
+  //                   std::chrono::duration<double, std::milli>(t5 -
+  //                   t4).count());
 
   // CRITICAL: You forgot to assign the result to out_cloud!
   *out_cloud = *raw_cloud;

@@ -2,7 +2,7 @@
     <!-- Main Node -->
     <node pkg="lidar_scan_match_c" type="lidar_scan_match_c_node" name="lidar_scan_match_c_node" output="screen">
         <!-- Load parameters into private namespace -->
-        <rosparam file="$(find lidar_scan_match_c)/config/params.yaml" command="load" />
+        <rosparam file="$(find lidar_scan_match_c)/config/params_0605a.yaml" command="load" />
     </node>
 
     <!-- RViz -->

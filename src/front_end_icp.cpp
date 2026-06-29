@@ -94,7 +94,7 @@ void FrontEndICP::updateHDMapCloud(const CloudType::Ptr &cloud) {
     hd_map_gicp_tree_ = gicp_tree;
   }
 
-  ROS_INFO("HD Map updated and small_gicp tree precomputed (non-blocking).");
+  // ROS_INFO("HD Map updated and small_gicp tree precomputed (non-blocking).");
 }
 
 bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
@@ -112,11 +112,11 @@ bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
 
   auto current_settings = gicp_settings_;
   if (is_turning) {
-    // 轉彎時加大搜尋範圍 (原本是 2.0m 太小)，允許 ICP
-    // 在旋轉預測稍有偏差時仍能抓到特徵
-    current_settings.max_correspondence_distance = 15.0;
+    // 轉彎時稍微加大搜尋範圍，但不要硬編碼到 15.0 導致 KDTree 崩潰
+    current_settings.max_correspondence_distance =
+        std::max(current_settings.max_correspondence_distance, 8.0);
     current_settings.max_iterations =
-        gicp_settings_.max_iterations * 2; // 增加迭代次數
+        std::min(200, gicp_settings_.max_iterations + 50);
   }
 
   // Estimate covariances for both (Requirement for GICP)
@@ -127,8 +127,6 @@ bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
 
   Eigen::Isometry3d init_guess(out_transform.cast<double>());
   auto t0 = std::chrono::steady_clock::now();
-  ROS_INFO_THROTTLE(1.0, "[Detect Distance] Max Distance: %.2f.",
-                    current_settings.max_correspondence_distance);
 
   // 使用 GICP 進行對齊，考慮表面幾何，精度與魯棒性更高
   auto result = small_gicp::align(*target_gicp, *source_gicp, target_tree,
@@ -179,9 +177,9 @@ bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
 
   double d_align = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-  ROS_INFO_THROTTLE(1.0,
-                    "[HD Profiler] Align:%.1fms, Fitness: %.4f, Inliers: %ld",
-                    d_align, out_fitness_score, result.num_inliers);
+  ROS_INFO_THROTTLE(
+      1.0, "[INFO] HD Profiler: Align:%.1fms, Fitness: %.4f, Inliers: %ld",
+      d_align, out_fitness_score, result.num_inliers);
 
   if (result.num_inliers > 100 &&
       out_fitness_score < icp_threshold.max_fitness) {
@@ -197,11 +195,10 @@ bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
 
 bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
                                    Eigen::Matrix4f &out_transform,
-                                   double &out_fitness_score, bool is_turning) {
+                                   double &out_fitness_score, bool is_turning,
+                                   bool is_initialization) {
   if (!current_cloud || current_cloud->empty())
     return false;
-
-  auto t0 = std::chrono::steady_clock::now();
 
   // 1. Get HD Map Pointers (Mutex check)
   std::shared_ptr<small_gicp::PointCloud> target_gicp;
@@ -213,13 +210,13 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
     target_gicp = hd_map_gicp_cloud_;
     target_tree = hd_map_gicp_tree_;
   }
-  auto t1 = std::chrono::steady_clock::now();
 
   auto current_settings = gicp_settings_;
   if (is_turning) {
-    // 全域地圖匹配同樣加大範圍與迭代次數
-    current_settings.max_correspondence_distance = 15.0;
-    current_settings.max_iterations = gicp_settings_.max_iterations * 2;
+    current_settings.max_correspondence_distance =
+        std::max(current_settings.max_correspondence_distance, 8.0);
+    current_settings.max_iterations =
+        std::min(200, gicp_settings_.max_iterations + 50);
   }
 
   // 2. Source Cloud Conversion
@@ -228,7 +225,6 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
       std::make_shared<small_gicp::KdTree<small_gicp::PointCloud>>(source_gicp);
   small_gicp::estimate_covariances_omp(*source_gicp, *source_tree, 20,
                                        current_settings.num_threads);
-  auto t2 = std::chrono::steady_clock::now();
 
   /*
   // --- DEBUG: Save clouds to check overlap ---
@@ -273,7 +269,19 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
   Eigen::Isometry3d init_guess(out_transform.cast<double>());
   auto result = small_gicp::align(*target_gicp, *source_gicp, *target_tree,
                                   init_guess, current_settings);
-  auto t3 = std::chrono::steady_clock::now();
+
+  if (is_initialization) {
+    ROS_INFO("[INFO] Initialization: Using IMU orientation as initial guess "
+             "for HD Map "
+             "localization...");
+    // CRITICAL: GPS initial position might be off by 10+ meters!
+    // We use a huge search radius during initialization to pull it in.
+    current_settings.max_correspondence_distance = 400.0;
+    current_settings.max_iterations = 200;
+
+    result = small_gicp::align(*target_gicp, *source_gicp, *target_tree,
+                               init_guess, current_settings);
+  }
 
   /*
   std::cout << "--- T_target_source ---" << std::endl
@@ -303,14 +311,6 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
 }
 // -----------------------------------
 */
-
-  double d_lock = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  double d_conv = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  double d_align = std::chrono::duration<double, std::milli>(t3 - t2).count();
-
-  ROS_INFO_THROTTLE(
-      1.0, "[HD Profiler] Lock:%.1fms, ConvSource:%.1fms, Align:%.1fms", d_lock,
-      d_conv, d_align);
 
   // == 最後才回報真假值給外部流程 ==
   return result.converged;
@@ -354,7 +354,7 @@ void FrontEndICP::getLocalMap(CloudType::Ptr &out_local_map) {
   // Optional: Downsample the local map if it's too large
   if (out_local_map->size() > 50000) {
     pcl::VoxelGrid<PointType> vg;
-    vg.setLeafSize(0.5, 0.5, 0.5);
+    vg.setLeafSize(0.2, 0.2, 0.2);
     vg.setInputCloud(out_local_map);
     vg.filter(*out_local_map);
   }
