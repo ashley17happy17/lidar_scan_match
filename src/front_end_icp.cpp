@@ -4,6 +4,7 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/kdtree/kdtree_flann.h>
+#include <small_gicp/ann/gaussian_voxelmap.hpp>
 #include <small_gicp/points/point_cloud.hpp>
 #include <small_gicp/registration/registration_helper.hpp>
 #include <small_gicp/util/normal_estimation_omp.hpp>
@@ -36,6 +37,7 @@ FrontEndICP::FrontEndICP(ros::NodeHandle &nh) {
   nh.param<double>("icp_euclidean_fitness_epsilon", fit_eps, 1e-4);
   nh.param<double>("icp_max_dist_sq", max_dist_sq, 9.0);
   nh.param<int>("icp_num_threads", num_threads, 10);
+  nh.param<bool>("use_vgicp", use_vgicp_, true);
 
   // Set to GICP (Generalized ICP) - much more robust than standard ICP
   gicp_settings_.type = small_gicp::RegistrationSetting::GICP;
@@ -87,11 +89,15 @@ void FrontEndICP::updateHDMapCloud(const CloudType::Ptr &cloud) {
   small_gicp::estimate_covariances_omp(*gicp_cloud, *gicp_tree, 20,
                                        gicp_settings_.num_threads);
 
+  // Create VoxelMap for VGICP
+  auto voxelmap = small_gicp::create_gaussian_voxelmap(*gicp_cloud, 1.0); // 1.0m resolution
+
   // 2. Only lock for the pointer assignment
   {
     std::lock_guard<std::mutex> lock(hd_map_mutex_);
     hd_map_gicp_cloud_ = gicp_cloud;
     hd_map_gicp_tree_ = gicp_tree;
+    hd_map_voxelmap_ = voxelmap;
   }
 
   // ROS_INFO("HD Map updated and small_gicp tree precomputed (non-blocking).");
@@ -107,32 +113,55 @@ bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
   auto target_gicp = toGicpCloud(target_cloud);
   auto source_gicp = toGicpCloud(source_cloud);
 
+  auto current_settings = gicp_settings_;
+
+  // Target covariances MUST be calculated for both VGICP and GICP
   small_gicp::KdTree<small_gicp::PointCloud> target_tree(target_gicp);
+  small_gicp::estimate_covariances_omp(*target_gicp, target_tree, 20,
+                                       current_settings.num_threads);
+
   small_gicp::KdTree<small_gicp::PointCloud> source_tree(source_gicp);
 
-  auto current_settings = gicp_settings_;
+  // Calculate Source covariances.
+  small_gicp::estimate_covariances_omp(*source_gicp, source_tree, 20,
+                                       current_settings.num_threads);
+
   if (is_turning) {
-    // 轉彎時稍微加大搜尋範圍，但不要硬編碼到 15.0 導致 KDTree 崩潰
     current_settings.max_correspondence_distance =
         std::max(current_settings.max_correspondence_distance, 8.0);
     current_settings.max_iterations =
         std::min(200, gicp_settings_.max_iterations + 50);
   }
 
-  // Estimate covariances for both (Requirement for GICP)
-  small_gicp::estimate_covariances_omp(*target_gicp, target_tree, 20,
-                                       current_settings.num_threads);
-  small_gicp::estimate_covariances_omp(*source_gicp, source_tree, 20,
-                                       current_settings.num_threads);
-
   Eigen::Isometry3d init_guess(out_transform.cast<double>());
   auto t0 = std::chrono::steady_clock::now();
+  small_gicp::RegistrationResult result;
 
-  // 使用 GICP 進行對齊，考慮表面幾何，精度與魯棒性更高
-  auto result = small_gicp::align(*target_gicp, *source_gicp, target_tree,
-                                  init_guess, current_settings);
+  if (use_vgicp_) {
+    // Create a Gaussian VoxelMap for the target (O(1) lookup)
+    auto target_voxelmap = small_gicp::create_gaussian_voxelmap(
+        *target_gicp, 1.0); // 1.0m resolution
+    current_settings.type = small_gicp::RegistrationSetting::VGICP;
+    result = small_gicp::align(*target_voxelmap, *source_gicp, init_guess,
+                               current_settings);
+  } else {
+    current_settings.type = small_gicp::RegistrationSetting::GICP;
+    result = small_gicp::align(*target_gicp, *source_gicp, target_tree,
+                               init_guess, current_settings);
+  }
 
   auto t1 = std::chrono::steady_clock::now();
+  double dt = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  
+  total_icp_frames_++;
+  total_icp_time_ms_ += dt;
+  double avg_time = total_icp_time_ms_ / total_icp_frames_;
+  double data_time = source_cloud->header.stamp / 1e6;
+  if (first_data_time_ < 0) first_data_time_ = data_time;
+  double elapsed_data_time = data_time - first_data_time_;
+  
+  ROS_INFO("[Local Map ICP] Data Time: %.2f s | %s | Cost: %.2f ms | Avg: %.2f ms | Total ICP Time: %.2f s", 
+           elapsed_data_time, use_vgicp_ ? "VGICP" : "GICP", dt, avg_time, total_icp_time_ms_ / 1000.0);
 
   // == 無論成功與否，都先將最後的結果提取出來 ==
   Eigen::Matrix4d T_res = result.T_target_source.matrix();
@@ -203,12 +232,14 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
   // 1. Get HD Map Pointers (Mutex check)
   std::shared_ptr<small_gicp::PointCloud> target_gicp;
   std::shared_ptr<small_gicp::KdTree<small_gicp::PointCloud>> target_tree;
+  std::shared_ptr<small_gicp::GaussianVoxelMap> target_voxelmap;
   {
     std::lock_guard<std::mutex> lock(hd_map_mutex_);
     if (!hd_map_gicp_cloud_ || !hd_map_gicp_tree_)
       return false;
     target_gicp = hd_map_gicp_cloud_;
     target_tree = hd_map_gicp_tree_;
+    target_voxelmap = hd_map_voxelmap_;
   }
 
   auto current_settings = gicp_settings_;
@@ -265,22 +296,43 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
   // -------------------------------------------
   */
 
-  // Pass the prebuilt target KdTree to GICP alignment
   Eigen::Isometry3d init_guess(out_transform.cast<double>());
-  auto result = small_gicp::align(*target_gicp, *source_gicp, *target_tree,
-                                  init_guess, current_settings);
+  auto t0 = std::chrono::steady_clock::now();
+  small_gicp::RegistrationResult result;
 
   if (is_initialization) {
-    ROS_INFO("[INFO] Initialization: Using IMU orientation as initial guess "
-             "for HD Map "
-             "localization...");
-    // CRITICAL: GPS initial position might be off by 10+ meters!
-    // We use a huge search radius during initialization to pull it in.
+    ROS_INFO("[INFO] Initialization: Using IMU orientation as initial guess for HD Map localization...");
     current_settings.max_correspondence_distance = 400.0;
     current_settings.max_iterations = 200;
+    
+    // Always use GICP for initialization because huge correspondence distances don't work well with fixed voxel grids
+    current_settings.type = small_gicp::RegistrationSetting::GICP;
+    result = small_gicp::align(*target_gicp, *source_gicp, *target_tree, init_guess, current_settings);
+  } else {
+    if (use_vgicp_ && target_voxelmap) {
+      current_settings.type = small_gicp::RegistrationSetting::VGICP;
+      result = small_gicp::align(*target_voxelmap, *source_gicp, init_guess, current_settings);
+    } else {
+      current_settings.type = small_gicp::RegistrationSetting::GICP;
+      result = small_gicp::align(*target_gicp, *source_gicp, *target_tree, init_guess, current_settings);
+    }
+  }
 
-    result = small_gicp::align(*target_gicp, *source_gicp, *target_tree,
-                               init_guess, current_settings);
+  auto t1 = std::chrono::steady_clock::now();
+  double dt = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  
+  if (!is_initialization) {
+    total_icp_frames_++;
+    total_icp_time_ms_ += dt;
+    double avg_time = total_icp_time_ms_ / total_icp_frames_;
+    double data_time = current_cloud->header.stamp / 1e6;
+    if (first_data_time_ < 0) first_data_time_ = data_time;
+    double elapsed_data_time = data_time - first_data_time_;
+    
+    ROS_INFO("[HD Map ICP] Data Time: %.2f s | %s | Cost: %.2f ms | Avg: %.2f ms | Total ICP Time: %.2f s", 
+             elapsed_data_time, use_vgicp_ ? "VGICP" : "GICP", dt, avg_time, total_icp_time_ms_ / 1000.0);
+  } else {
+    ROS_INFO("[HD Map ICP] Initialization took: %.2f ms", dt);
   }
 
   /*

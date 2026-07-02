@@ -70,6 +70,7 @@ crop_min_bound: [10.0, 3.0, 1.8]        #unit: meter
 crop_max_bound: [60.0, 60.0, 30.0]      #unit: meter
 
 # Small-GICP
+use_vgicp: true                         # Switch to false to compare with standard GICP
 icp_max_iterations: 100                 # unit: count
 icp_rotation_epsilon: 5e-3              # unit: rad
 icp_transformation_epsilon: 1e-2        # unit: meter

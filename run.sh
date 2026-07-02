@@ -14,6 +14,8 @@ cd /root/catkin_ws
 catkin_make
 source devel/setup.bash
 
+export ROS_HOSTNAME=localhost
+export ROS_MASTER_URI=http://localhost:11311
 # # Ensure DISPLAY is correct (native Linux typically uses :0)
 # if [ -z "$DISPLAY" ]; then
 #     export DISPLAY=:0

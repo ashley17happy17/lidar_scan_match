@@ -56,11 +56,18 @@ private:
   small_gicp::RegistrationSetting gicp_settings_;
   LoopClosureThreshold loop_closure_threshold_;
   ICPThreshold icp_threshold;
+  bool use_vgicp_;
+
+  // Timing Accumulators
+  double total_icp_time_ms_ = 0.0;
+  int total_icp_frames_ = 0;
+  double first_data_time_ = -1.0;
 
   std::mutex hd_map_mutex_;
   // holds precomputed downsampled map cloud and its search tree
   std::shared_ptr<small_gicp::PointCloud> hd_map_gicp_cloud_;
   std::shared_ptr<small_gicp::KdTree<small_gicp::PointCloud>> hd_map_gicp_tree_;
+  std::shared_ptr<small_gicp::GaussianVoxelMap> hd_map_voxelmap_;
 
   // Loop closure history
   std::vector<CloudType::Ptr> keyframe_clouds_;

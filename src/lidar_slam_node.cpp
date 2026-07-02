@@ -516,6 +516,7 @@ private:
       CloudType::Ptr cloud(new CloudType());
       std::vector<double> timestamps;
       preprocess_->processCloud(lidar_msg, cloud, timestamps);
+      cloud->header.stamp = lidar_time * 1e6; // Store timestamp in microseconds
 
       try {
         // Frequency control: Only perform Scan Matching at the specified rate
@@ -1041,14 +1042,24 @@ private:
             std::chrono::duration<double, std::milli>(t_loop_end - t_loop_start)
                 .count();
 
+        static double total_pipeline_cost_ms = 0.0;
+        static double first_pipeline_data_time = -1.0;
+        static int pipeline_frame_count = 0;
+
+        total_pipeline_cost_ms += total_ms;
+        pipeline_frame_count++;
+        if (first_pipeline_data_time < 0) {
+          first_pipeline_data_time = lidar_time;
+        }
+        double elapsed_data_time = lidar_time - first_pipeline_data_time;
+
+        ROS_INFO("[Pipeline] Data Time: %.2f s | Cost: %.2f ms | Avg: %.2f ms | Total CPU: %.2f s",
+                 elapsed_data_time, total_ms, total_pipeline_cost_ms / pipeline_frame_count, total_pipeline_cost_ms / 1000.0);
+
         if (buf_size > 2) {
           ROS_WARN_THROTTLE(
               1.0, "[WARN] Offline: catching up... Lidar Buffer Size: %zu",
               buf_size);
-        } else {
-          ROS_INFO_THROTTLE(
-              2.0, "[INFO] Realtime: total Latency: %.1f ms (Buffer: %zu)",
-              total_ms, buf_size);
         }
       } catch (std::exception &e) {
         ROS_ERROR("Exception: %s", e.what());
