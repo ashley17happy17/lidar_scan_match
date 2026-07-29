@@ -32,7 +32,7 @@ crop_min_bound: [10.0, 3.0, 1.8]        #unit: meter
 crop_max_bound: [60.0, 60.0, 30.0]      #unit: meter
 
 # Small-GICP
-use_vgicp: true                         # Switch to false to compare with standard GICP
+use_vgicp: false                         # Switch to false to compare with standard GICP
 icp_max_iterations: 100                 # unit: count
 icp_rotation_epsilon: 5e-3              # unit: rad
 icp_transformation_epsilon: 1e-2        # unit: meter
@@ -54,8 +54,15 @@ gps_cov_multiplier: 1.5                # unit: ratio (Inflate GPS noise to balan
 icp_max_acceptable_fitness_score: 2.0   # unitless (Discard matching above this error)
 max_single_frame_translation: 3.0       # unit: meter (Failsafe for IMU prediction jumps)
 max_single_frame_rotation: 0.5         # Max allowed rotation per frame (rad, ~28deg)
+local_match_jump_gate: 1.0              # unit: meter (Base jump gate for accepting a Local Map match)
+local_match_jump_relax_step: 0.5        # unit: meter (Gate relaxes by this much per consecutive failure)
+local_match_max_consecutive_failures: 5 # unit: count (Force local map refresh after this many failures)
+gps_fallback_min_failures: 3            # unit: count (Inject loose-covariance GPS once local match fails this many times outside HD Map)
+gps_std_thres_no_map: 5.0               # unit: meter (Trust standard-precision GPS over local-map ICP whenever outside HD Map)
+no_map_use_gps_only: false              # bool: outside HD Map, skip lidar scan-to-local-map entirely and trust GPS/IMU directly
+no_map_gps_fixed_std: 2.0               # unit: meter (Assumed GPS 2D std-dev used when no_map_use_gps_only is true, ignores reported covariance)
 
 # Output
-out_trajectory_path: "/root/catkin_ws/src/lidar_scan_match_c/output/lidar_trajectory_ph3_test1.csv"
+out_trajectory_path: "/root/catkin_ws/data/data_collection/output/20260714_b_traj/lidar_traj.csv"
 out_save: true                          # bool: whether to save CSV on exit
 out_hz: 10                              # unit: Hz (Trajectory recording frequency)

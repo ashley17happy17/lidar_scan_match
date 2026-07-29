@@ -33,6 +33,7 @@ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 
   LidarSlamSystem(ros::NodeHandle &nh) : nh_(nh) {
+    start_time_ = std::chrono::steady_clock::now();
     preprocess_ = std::make_shared<SensorPreprocess>(nh_);
     frontend_ = std::make_shared<FrontEndICP>(nh_);
     backend_ = std::make_shared<BackEndOptimization>(nh_);
@@ -63,6 +64,31 @@ public:
 
     nh_.param<double>("max_single_frame_translation", max_trans_jump_, 1.5);
     nh_.param<double>("max_single_frame_rotation", max_rot_jump_, 0.5);
+
+    // Local Map failure recovery: gate relaxes with each consecutive
+    // rejection so a merely-drifted (but otherwise valid) match isn't stuck
+    // behind a fixed threshold; past the cap we give up and re-anchor.
+    nh_.param<double>("local_match_jump_gate", local_match_jump_gate_, 1.0);
+    nh_.param<double>("local_match_jump_relax_step",
+                      local_match_jump_relax_step_, 0.5);
+    nh_.param<int>("local_match_max_consecutive_failures",
+                   local_match_max_failures_, 5);
+    // Outside the HD Map, once lidar odometry has been failing for a while,
+    // low-precision GPS is no longer worse than unconstrained IMU dead
+    // reckoning - inject it loosely as a floor against unbounded drift.
+    nh_.param<int>("gps_fallback_min_failures", gps_fallback_min_failures_, 3);
+    // Outside the HD Map, scan-to-local-map is much more prone to
+    // degenerate/no-map drift than a live (even non-RTK) GPS fix - trust it
+    // continuously there instead of only as a post-failure fallback.
+    nh_.param<double>("gps_std_thres_no_map", gps_std_thres_no_map_, 5.0);
+
+    // Manual override: outside the HD Map, trust GPS/IMU prediction directly
+    // and skip lidar scan-to-local-map correction entirely. Use this when
+    // the covariance-based trust logic above isn't enough - e.g. the GPS
+    // source doesn't report usable covariance, so it can never win the
+    // has_cov-gated comparisons no matter how good it actually is.
+    nh_.param<bool>("no_map_use_gps_only", no_map_use_gps_only_, false);
+    nh_.param<double>("no_map_gps_fixed_std", no_map_gps_fixed_std_, 2.0);
 
     last_reg_time_ = -1.0;
     last_record_time_ = -1.0;
@@ -99,13 +125,33 @@ public:
   }
 
   ~LidarSlamSystem() {
-    if (out_save_) {
-      saveTrajectory();
-    }
+    std::cout << "[INFO] LidarSlamSystem shutting down..." << std::endl;
+    // Join first so total_pipeline_cost_ms_ (written by process_thread_) is
+    // done updating before we read it below.
     if (process_thread_.joinable())
       process_thread_.join();
     if (map_loader_thread_.joinable())
       map_loader_thread_.join();
+
+    double elapsed_s = std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - start_time_)
+                           .count();
+    int elapsed_min = static_cast<int>(elapsed_s) / 60;
+    double elapsed_sec_rem = elapsed_s - elapsed_min * 60;
+    std::cout << "[INFO] Total runtime: " << elapsed_min << "m "
+              << std::fixed << std::setprecision(1) << elapsed_sec_rem
+              << "s (" << elapsed_s << "s) | Total computation time: "
+              << (total_pipeline_cost_ms_ / 1000.0) << "s ("
+              << (elapsed_s > 0
+                      ? (total_pipeline_cost_ms_ / 1000.0 / elapsed_s * 100.0)
+                      : 0.0)
+              << "% of runtime)" << std::endl;
+    if (out_save_) {
+      std::cout << "[INFO] Saving trajectory to " << out_trajectory_path_
+                << std::endl;
+      saveTrajectory();
+      std::cout << "[INFO] Trajectory saved successfully." << std::endl;
+    }
   }
 
 private:
@@ -114,8 +160,60 @@ private:
     double lat, lon, h;
     double twdx, twdy, twdz;
     double roll, pitch, yaw;
+    std::string source;
   };
   std::vector<TrajectoryPoint> recorded_trajectory_;
+
+  // Interpolate an SE(3) pose at fraction t in [0,1] between a and b
+  // (SLERP for rotation, LERP for translation).
+  static Eigen::Matrix4f interpolatePose(const Eigen::Matrix4f &a,
+                                         const Eigen::Matrix4f &b, float t) {
+    t = std::max(0.0f, std::min(1.0f, t));
+    Eigen::Quaternionf qa(a.block<3, 3>(0, 0));
+    Eigen::Quaternionf qb(b.block<3, 3>(0, 0));
+    Eigen::Quaternionf q = qa.slerp(t, qb);
+    Eigen::Vector3f p =
+        (1.0f - t) * a.block<3, 1>(0, 3) + t * b.block<3, 1>(0, 3);
+    Eigen::Matrix4f out = Eigen::Matrix4f::Identity();
+    out.block<3, 3>(0, 0) = q.toRotationMatrix();
+    out.block<3, 1>(0, 3) = p;
+    return out;
+  }
+
+  // Convert a T_map_lidar pose into a TrajectoryPoint stamped at `t`.
+  TrajectoryPoint poseToTrajectoryPoint(const Eigen::Matrix4f &pose, double t) {
+    TrajectoryPoint tp;
+    Eigen::Matrix4f T_imu_lidar = backend_->getExtrinsic().matrix().cast<float>();
+    Eigen::Matrix4f T_map_imu = pose * T_imu_lidar.inverse();
+    Eigen::Quaternionf q_veh(T_map_imu.block<3, 3>(0, 0));
+
+    tp.time = t;
+    tp.twdx = T_map_imu(0, 3) + map_origin_twd97_.x();
+    tp.twdy = T_map_imu(1, 3) + map_origin_twd97_.y();
+    tp.twdz = T_map_imu(2, 3) + map_origin_twd97_.z();
+
+    // Convert Map Frame (ENU) to Lat/Lon/H
+    gps_translator_internal_.GetWGS84(tp.twdx, tp.twdy, tp.twdz, tp.lat, tp.lon,
+                                      tp.h);
+
+    // Convert Vehicle Quaternion (q_veh) to Roll, Pitch, Yaw (rad)
+    double sinr_cosp = 2 * (q_veh.w() * q_veh.x() + q_veh.y() * q_veh.z());
+    double cosr_cosp = 1 - 2 * (q_veh.x() * q_veh.x() + q_veh.y() * q_veh.y());
+    tp.roll = std::atan2(sinr_cosp, cosr_cosp);
+
+    double sinp = 2 * (q_veh.w() * q_veh.y() - q_veh.z() * q_veh.x());
+    if (std::abs(sinp) >= 1)
+      tp.pitch = std::copysign(M_PI / 2, sinp);
+    else
+      tp.pitch = std::asin(sinp);
+
+    // Heading (Yaw) using the vehicle's forward vector
+    Eigen::Vector3f veh_forward_in_map =
+        T_map_imu.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
+    tp.yaw = std::atan2(veh_forward_in_map.x(), veh_forward_in_map.y());
+    tp.source = "MAP";
+    return tp;
+  }
 
   void saveTrajectory() {
     std::string filename = out_trajectory_path_;
@@ -126,12 +224,14 @@ private:
                 filename.c_str());
       return;
     }
-    f << "time,lat,lon,h,twd97x,twd97y,twd97z,roll_rad,pitch_rad,yaw_rad\n";
-    f << std::fixed << std::setprecision(8);
+    f << "time_ms,lat,lon,h,twd97x,twd97y,twd97z,roll_rad,pitch_rad,yaw_rad,source\n";
     for (const auto &p : recorded_trajectory_) {
-      f << p.time << "," << p.lat << "," << p.lon << "," << p.h << "," << p.twdx
-        << "," << p.twdy << "," << p.twdz << "," << p.roll << "," << p.pitch
-        << "," << p.yaw << "\n";
+      // Timestamp in integer milliseconds (sub-ms digits truncated).
+      long long time_ms = static_cast<long long>(std::round(p.time * 1000.0));
+      f << time_ms << std::fixed << std::setprecision(8) << "," << p.lat << ","
+        << p.lon << "," << p.h << "," << p.twdx << "," << p.twdy << ","
+        << p.twdz << "," << p.roll << "," << p.pitch << "," << p.yaw << ","
+        << p.source << "\n";
     }
     f.close();
     ROS_INFO("[Output] Successfully saved %zu trajectory points to %s",
@@ -413,6 +513,7 @@ private:
 
       static bool currently_within_hd_bounds = false;
       static int consecutive_hd_map_failures = 0;
+      static int consecutive_local_match_failures = 0;
       static double current_gps_speed = 0.0; // Global to processLoop for ZUPT
       static double last_gps_time_for_speed = -1.0;
       static Eigen::Vector2d last_gps_pos_2d(0, 0);
@@ -430,6 +531,11 @@ private:
           gm.latitude = tx - map_origin_twd97_.x();
           gm.longitude = ty - map_origin_twd97_.y();
           gm.altitude = tz - map_origin_twd97_.z();
+
+          // Collect GPS timestamps so the trajectory can be recorded at the
+          // exact GPS instant (pose interpolated in publishData), not the
+          // lidar frame time.
+          pending_gps_times_.push_back(gm.timestamp);
 
           Eigen::Vector2d curr_gps_pos_2d(gm.latitude, gm.longitude);
           if (last_gps_time_for_speed > 0) {
@@ -458,7 +564,20 @@ private:
                           sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN) &&
                          (cov_x > 0.0001);
 
-          if (has_cov && cov_h < gps_std_thres_) {
+          if (!currently_within_hd_bounds && no_map_use_gps_only_) {
+            // 手動切換：地圖外一律直接信任 GPS，不管 covariance
+            // 是否可用 - 用來因應 GPS 來源根本沒有回報有效
+            // covariance，導致上面以 covariance 為準的判斷永遠無法
+            // 讓 GPS 勝出的情況
+            double fixed_var = no_map_gps_fixed_std_ * no_map_gps_fixed_std_;
+            gm.covariance_diag << fixed_var, fixed_var, fixed_var;
+            backend_->addGpsFactor(gm);
+            ROS_INFO_THROTTLE(
+                2.0,
+                "[INFO] GPS: no_map_use_gps_only active - trusting GPS "
+                "directly outside HD Map (fixed 2DStdDev: %.2fm).",
+                no_map_gps_fixed_std_);
+          } else if (has_cov && cov_h < gps_std_thres_) {
             // 將高精度的變異數真實反映給 GTSAM，並乘上人工權重係數 (Covariance
             // 越大代表越不信任)
             if (!currently_within_hd_bounds || !has_hd_map_matched_ ||
@@ -493,6 +612,40 @@ private:
               gm.covariance_diag << loose_var, loose_var, loose_var;
               backend_->addGpsFactor(gm);
             }
+          } else if (!currently_within_hd_bounds && has_cov &&
+                    cov_h < gps_std_thres_no_map_) {
+            // 沒有 HD Map 時，Lidar 只能靠 scan-to-local-map，比起有 HD Map
+            // 校正時更容易因幾何退化或長期漂移而失準。因此在地圖範圍外，
+            // 就算不是 RTK 等級，也直接以真實 covariance 信任 GPS，而非
+            // 等到連續失敗才注入 - 讓 GTSAM 依照真實精度自然權衡兩者
+            gm.covariance_diag << cov_x * gps_cov_multiplier_,
+                cov_y * gps_cov_multiplier_, cov_z * gps_cov_multiplier_;
+            backend_->addGpsFactor(gm);
+            ROS_INFO_THROTTLE(
+                1.0,
+                "[INFO] GPS: Standard-precision GPS trusted over local-map "
+                "ICP outside HD Map (2DStdDev: %.2fm).",
+                cov_h);
+          } else if ((!currently_within_hd_bounds &&
+                     consecutive_local_match_failures >=
+                         gps_fallback_min_failures_) ||
+                    (currently_within_hd_bounds &&
+                     consecutive_hd_map_failures >=
+                         gps_fallback_min_failures_)) {
+            // Lidar 校正 (Local Map 或 HD Map) 已連續失敗多次：純 IMU
+            // 航位推算會無限漂移，此時就算是低精度 GPS 也比完全沒有校正好，
+            // 以寬鬆的 covariance 注入做為漂移的下限保護，讓 predicted_pose
+            // 不至於無界漂移，而不是放寬會影響車道正確性的匹配門檻
+            double loose_var = std::max(cov_h * cov_h, 25.0);
+            gm.covariance_diag << loose_var, loose_var, loose_var;
+            backend_->addGpsFactor(gm);
+            ROS_WARN_THROTTLE(
+                1.0,
+                "[INFO] GPS: Lidar correction failed repeatedly (local:%d, "
+                "hd:%d). Injecting low-precision GPS as drift floor "
+                "(2DStdDev: %.2fm).",
+                consecutive_local_match_failures, consecutive_hd_map_failures,
+                cov_h);
           } else {
             // 如果是一般 GPS (誤差數公尺)，則不丟入優化器，避免撕裂 HD Map
             // 的精準軌跡
@@ -794,7 +947,17 @@ private:
             // "當沒有hdmap的時候 才會誘發scanmatch"
             was_in_hd_map = false;
 
-            if (has_last_keyframe_ && !local_map->empty()) {
+            if (no_map_use_gps_only_) {
+              // 手動切換：地圖外不做 lidar 修正，直接信任 GPS/IMU
+              // 融合後的 current_pose (predicted_pose)。local map/keyframe
+              // 仍然照常累積，供視覺化與日後重新進入 HD Map 使用
+              local_match_success = true;
+              consecutive_local_match_failures = 0;
+              if (!has_last_keyframe_) {
+                has_last_keyframe_ = true;
+                last_keyframe_pose_ = current_pose;
+              }
+            } else if (has_last_keyframe_ && !local_map->empty()) {
               if (frontend_->scanMatch(cloud, local_map, local_pose, fitness,
                                        is_turning)) {
                 double jump = (local_pose.block<3, 1>(0, 3) -
@@ -805,10 +968,16 @@ private:
                 if (is_turning) {
                   local_threshold *= 1.5; // 轉彎時放寬至 1.5 倍
                 }
-                if (jump < 1.0) {
+                // 每次連續失敗就放寬跳動門檻：先前的失敗會讓 current_pose
+                // 持續以純 IMU 漂移，導致本來合理的匹配也被固定門檻擋下
+                double jump_gate =
+                    local_match_jump_gate_ +
+                    consecutive_local_match_failures * local_match_jump_relax_step_;
+                if (jump < jump_gate) {
                   current_pose =
                       local_pose; // 永遠採信 Lidar Odometry 避免 IMU 預測失控
                   local_match_success = true;
+                  consecutive_local_match_failures = 0;
 
                   if (fitness >= local_threshold) {
                     ROS_WARN_THROTTLE(
@@ -818,11 +987,15 @@ private:
                         fitness, local_threshold);
                   }
                 } else {
+                  consecutive_local_match_failures++;
                   ROS_WARN_THROTTLE(
                       1.0,
-                      "[WARN] Local Map: Rejected match: jump=%.2fm > 1.0m",
-                      jump);
+                      "[WARN] Local Map: Rejected match: jump=%.2fm > "
+                      "%.2fm (fail #%d)",
+                      jump, jump_gate, consecutive_local_match_failures);
                 }
+              } else {
+                consecutive_local_match_failures++;
               }
             } else {
               // 剛離開 HD Map (或一開始就沒有)，強制信任 GPS/IMU 預測並做為
@@ -833,9 +1006,26 @@ private:
               local_match_success = true;
               has_last_keyframe_ = true;
               last_keyframe_pose_ = current_pose;
+              consecutive_local_match_failures = 0;
               ROS_INFO(
                   "[INFO] Local Map: Creating new local map anchor outside HD "
                   "Map.");
+            }
+
+            // 連續失敗次數過多：local map 可能已與實際場景脫節（幾何退化
+            // 或長期漂移），與其繼續卡死，不如直接以目前 IMU 預測位姿
+            // 重建 local map，讓系統有機會重新對齊
+            if (!local_match_success &&
+                consecutive_local_match_failures >= local_match_max_failures_) {
+              ROS_WARN("[WARN] Local Map: %d consecutive failures. Forcing "
+                       "local map refresh at current pose.",
+                       consecutive_local_match_failures);
+              frontend_->clearLocalMap();
+              local_map->clear();
+              local_match_success = true;
+              has_last_keyframe_ = true;
+              last_keyframe_pose_ = current_pose;
+              consecutive_local_match_failures = 0;
             }
 
             if (!local_match_success) {
@@ -1042,11 +1232,10 @@ private:
             std::chrono::duration<double, std::milli>(t_loop_end - t_loop_start)
                 .count();
 
-        static double total_pipeline_cost_ms = 0.0;
         static double first_pipeline_data_time = -1.0;
         static int pipeline_frame_count = 0;
 
-        total_pipeline_cost_ms += total_ms;
+        total_pipeline_cost_ms_ += total_ms;
         pipeline_frame_count++;
         if (first_pipeline_data_time < 0) {
           first_pipeline_data_time = lidar_time;
@@ -1054,7 +1243,7 @@ private:
         double elapsed_data_time = lidar_time - first_pipeline_data_time;
 
         ROS_INFO("[Pipeline] Data Time: %.2f s | Cost: %.2f ms | Avg: %.2f ms | Total CPU: %.2f s",
-                 elapsed_data_time, total_ms, total_pipeline_cost_ms / pipeline_frame_count, total_pipeline_cost_ms / 1000.0);
+                 elapsed_data_time, total_ms, total_pipeline_cost_ms_ / pipeline_frame_count, total_pipeline_cost_ms_ / 1000.0);
 
         if (buf_size > 2) {
           ROS_WARN_THROTTLE(
@@ -1082,6 +1271,12 @@ private:
   std::queue<sensor_msgs::ImuConstPtr> imu_buf_;
   Eigen::Matrix4f latest_pose_;
   std::thread process_thread_, map_loader_thread_;
+  std::chrono::steady_clock::time_point start_time_;
+  double total_pipeline_cost_ms_ = 0.0;
+  // Trajectory recording: interpolation bracket + pending GPS timestamps.
+  Eigen::Matrix4f traj_prev_pose_ = Eigen::Matrix4f::Identity();
+  double traj_prev_time_ = -1.0;
+  std::vector<double> pending_gps_times_;
   bool first_frame{false};
   Eigen::Vector3d map_origin_twd97_{0, 0, 0};
   std::atomic<bool> has_map_origin_{false};
@@ -1098,6 +1293,13 @@ private:
   double tile_size;
   double max_trans_jump_;
   double max_rot_jump_;
+  double local_match_jump_gate_;
+  double local_match_jump_relax_step_;
+  int local_match_max_failures_;
+  int gps_fallback_min_failures_;
+  double gps_std_thres_no_map_;
+  bool no_map_use_gps_only_;
+  double no_map_gps_fixed_std_;
 
   // Loop Closure Parameters
   bool loop_closure_enabled_;
@@ -1169,6 +1371,7 @@ private:
     // TF、點雲與里程計) 這能完全避免在匹配成功前，RViz
     // 畫面上先顯示錯誤坐標的點雲與軌跡，消除瞬間巨大跳變！
     if (!first_map_check_done_) {
+      pending_gps_times_.clear();
       return;
     }
 
@@ -1181,6 +1384,7 @@ private:
     }
 
     if (!allow_publishing) {
+      pending_gps_times_.clear();
       return;
     }
 
@@ -1261,46 +1465,31 @@ private:
     // 4.8 Publish Range Rings (5m & 10m)
     publishRangeRings(rts);
 
-    // 5. Record Trajectory Point at specified out_hz_
-    if (has_map_origin_) {
-      if (last_record_time_ < 0 || ts - last_record_time_ >= (0.95 / out_hz_)) {
-        last_record_time_ = ts;
-        TrajectoryPoint tp;
+    // 5. Record Trajectory Points at each GPS timestamp (pose interpolated to
+    // the exact GPS instant so time and pose stay consistent), rate-limited
+    // to out_hz_. GPS timestamps this cycle fall in (traj_prev_time_, ts].
+    if (has_map_origin_ && traj_prev_time_ >= 0.0 && ts > traj_prev_time_) {
+      double bracket = ts - traj_prev_time_;
+      for (double gt : pending_gps_times_) {
+        // Clamp any GPS time to the bracket (should already be inside it).
+        if (gt <= traj_prev_time_ || gt > ts)
+          continue;
+        if (last_record_time_ >= 0 &&
+            gt - last_record_time_ < (0.95 / out_hz_))
+          continue;
 
-        Eigen::Matrix4f T_imu_lidar =
-            backend_->getExtrinsic().matrix().cast<float>();
-        Eigen::Matrix4f T_map_imu = pose * T_imu_lidar.inverse();
-        Eigen::Quaternionf q_veh(T_map_imu.block<3, 3>(0, 0));
-
-        tp.time = ts;
-        tp.twdx = T_map_imu(0, 3) + map_origin_twd97_.x();
-        tp.twdy = T_map_imu(1, 3) + map_origin_twd97_.y();
-        tp.twdz = T_map_imu(2, 3) + map_origin_twd97_.z();
-
-        // Convert Map Frame (ENU) to Lat/Lon/H
-        gps_translator_internal_.GetWGS84(tp.twdx, tp.twdy, tp.twdz, tp.lat,
-                                          tp.lon, tp.h);
-
-        // Convert Vehicle Quaternion (q_veh) to Roll, Pitch, Yaw in Degrees
-        double sinr_cosp = 2 * (q_veh.w() * q_veh.x() + q_veh.y() * q_veh.z());
-        double cosr_cosp =
-            1 - 2 * (q_veh.x() * q_veh.x() + q_veh.y() * q_veh.y());
-        tp.roll = std::atan2(sinr_cosp, cosr_cosp);
-
-        double sinp = 2 * (q_veh.w() * q_veh.y() - q_veh.z() * q_veh.x());
-        if (std::abs(sinp) >= 1)
-          tp.pitch = std::copysign(M_PI / 2, sinp);
-        else
-          tp.pitch = std::asin(sinp);
-
-        // Calculate Heading (Yaw) using the VEHICLE'S forward vector
-        Eigen::Vector3f veh_forward_in_map =
-            T_map_imu.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
-        tp.yaw = std::atan2(veh_forward_in_map.x(), veh_forward_in_map.y());
-
-        recorded_trajectory_.push_back(tp);
+        float frac = static_cast<float>((gt - traj_prev_time_) / bracket);
+        Eigen::Matrix4f interp_pose =
+            interpolatePose(traj_prev_pose_, pose, frac);
+        recorded_trajectory_.push_back(poseToTrajectoryPoint(interp_pose, gt));
+        last_record_time_ = gt;
       }
     }
+
+    // Advance the interpolation bracket to this frame.
+    traj_prev_time_ = ts;
+    traj_prev_pose_ = pose;
+    pending_gps_times_.clear();
   }
 
   void publishRangeRings(const ros::Time &stamp) {

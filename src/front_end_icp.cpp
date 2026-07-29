@@ -128,7 +128,7 @@ bool FrontEndICP::scanMatch(const CloudType::Ptr &source_cloud,
 
   if (is_turning) {
     current_settings.max_correspondence_distance =
-        std::max(current_settings.max_correspondence_distance, 8.0);
+        std::max(current_settings.max_correspondence_distance, 10.0);
     current_settings.max_iterations =
         std::min(200, gicp_settings_.max_iterations + 50);
   }
@@ -245,7 +245,7 @@ bool FrontEndICP::scanToHDMapMatch(const CloudType::Ptr &current_cloud,
   auto current_settings = gicp_settings_;
   if (is_turning) {
     current_settings.max_correspondence_distance =
-        std::max(current_settings.max_correspondence_distance, 8.0);
+        std::max(current_settings.max_correspondence_distance, 10.0);
     current_settings.max_iterations =
         std::min(200, gicp_settings_.max_iterations + 50);
   }
