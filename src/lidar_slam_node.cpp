@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -54,6 +55,7 @@ public:
         "/root/catkin_ws/src/lidar_scan_match_c/output/lidar_trajectory.csv");
     nh_.param<bool>("out_save", out_save_, false);
     nh_.param<double>("out_hz", out_hz_, 10.0);
+    nh_.param<double>("gnss_diff_min_speed", gnss_diff_min_speed_, 2.0);
 
     // Loop Closure
     nh_.param<bool>("loop_closure_enabled", loop_closure_enabled_, true);
@@ -532,11 +534,6 @@ private:
           gm.longitude = ty - map_origin_twd97_.y();
           gm.altitude = tz - map_origin_twd97_.z();
 
-          // Collect GPS timestamps so the trajectory can be recorded at the
-          // exact GPS instant (pose interpolated in publishData), not the
-          // lidar frame time.
-          pending_gps_times_.push_back(gm.timestamp);
-
           Eigen::Vector2d curr_gps_pos_2d(gm.latitude, gm.longitude);
           if (last_gps_time_for_speed > 0) {
             double dt = gm.timestamp - last_gps_time_for_speed;
@@ -548,6 +545,15 @@ private:
           }
           last_gps_pos_2d = curr_gps_pos_2d;
           last_gps_time_for_speed = gm.timestamp;
+
+          // Collect the GPS fix so the trajectory can be recorded at the exact
+          // GPS instant (pose interpolated in publishData), not the lidar frame
+          // time. The position and speed ride along so publishData can also
+          // report the along-track GNSS/SLAM difference at that same instant.
+          pending_gps_.push_back(
+              {gm.timestamp,
+               Eigen::Vector3d(gm.latitude, gm.longitude, gm.altitude),
+               current_gps_speed});
 
           // 讀取 GPS 雜訊 (Covariance)
           double cov_x =
@@ -1276,7 +1282,18 @@ private:
   // Trajectory recording: interpolation bracket + pending GPS timestamps.
   Eigen::Matrix4f traj_prev_pose_ = Eigen::Matrix4f::Identity();
   double traj_prev_time_ = -1.0;
-  std::vector<double> pending_gps_times_;
+  // One entry per GPS fix drained this cycle: the fix instant, its ENU position
+  // (relative to map_origin_twd97_) and the GPS-derived speed at that instant.
+  // Kept as a single struct so time and position can never drift out of step.
+  struct PendingGps {
+    double time;
+    Eigen::Vector3d enu;
+    double speed;
+  };
+  std::vector<PendingGps> pending_gps_;
+  double gnss_diff_min_speed_;
+  double gnss_lag_sum_ = 0.0;
+  long gnss_lag_count_ = 0;
   bool first_frame{false};
   Eigen::Vector3d map_origin_twd97_{0, 0, 0};
   std::atomic<bool> has_map_origin_{false};
@@ -1371,7 +1388,7 @@ private:
     // TF、點雲與里程計) 這能完全避免在匹配成功前，RViz
     // 畫面上先顯示錯誤坐標的點雲與軌跡，消除瞬間巨大跳變！
     if (!first_map_check_done_) {
-      pending_gps_times_.clear();
+      pending_gps_.clear();
       return;
     }
 
@@ -1384,7 +1401,7 @@ private:
     }
 
     if (!allow_publishing) {
-      pending_gps_times_.clear();
+      pending_gps_.clear();
       return;
     }
 
@@ -1470,26 +1487,89 @@ private:
     // to out_hz_. GPS timestamps this cycle fall in (traj_prev_time_, ts].
     if (has_map_origin_ && traj_prev_time_ >= 0.0 && ts > traj_prev_time_) {
       double bracket = ts - traj_prev_time_;
-      for (double gt : pending_gps_times_) {
+      for (const auto &pg : pending_gps_) {
         // Clamp any GPS time to the bracket (should already be inside it).
-        if (gt <= traj_prev_time_ || gt > ts)
-          continue;
-        if (last_record_time_ >= 0 &&
-            gt - last_record_time_ < (0.95 / out_hz_))
+        if (pg.time <= traj_prev_time_ || pg.time > ts)
           continue;
 
-        float frac = static_cast<float>((gt - traj_prev_time_) / bracket);
+        float frac = static_cast<float>((pg.time - traj_prev_time_) / bracket);
         Eigen::Matrix4f interp_pose =
             interpolatePose(traj_prev_pose_, pose, frac);
-        recorded_trajectory_.push_back(poseToTrajectoryPoint(interp_pose, gt));
-        last_record_time_ = gt;
+
+        bool record = !(last_record_time_ >= 0 &&
+                        pg.time - last_record_time_ < (0.95 / out_hz_));
+
+        // Measure the GNSS/SLAM discrepancy on every fix, but only print it for
+        // the fixes that get recorded, so the log lines correspond 1:1 with the
+        // rows of the output trajectory and both run at out_hz_.
+        logGnssTrackDiff(pg, interp_pose, record);
+
+        if (!record)
+          continue;
+
+        recorded_trajectory_.push_back(
+            poseToTrajectoryPoint(interp_pose, pg.time));
+        last_record_time_ = pg.time;
       }
     }
 
     // Advance the interpolation bracket to this frame.
     traj_prev_time_ = ts;
     traj_prev_pose_ = pose;
-    pending_gps_times_.clear();
+    pending_gps_.clear();
+  }
+
+  // Decompose the GNSS-minus-SLAM offset into the vehicle's along-track and
+  // cross-track axes at a single GPS instant. Both poses refer to the same
+  // instant (the SLAM pose is interpolated), so a residual along-track term
+  // that scales with speed is a time offset, not a position error - hence the
+  // implied lag, which is the offset expressed in seconds.
+  void logGnssTrackDiff(const PendingGps &pg, const Eigen::Matrix4f &pose,
+                        bool do_print) {
+    // Compare in the vehicle (IMU) frame, matching how the trajectory is
+    // recorded and how GNSS enters the graph. The GNSS antenna lever arm is
+    // not compensated, so cross-track carries a small constant bias.
+    Eigen::Matrix4f T_imu_lidar =
+        backend_->getExtrinsic().matrix().cast<float>();
+    Eigen::Matrix4f T_map_imu = pose * T_imu_lidar.inverse();
+
+    double dx = pg.enu.x() - static_cast<double>(T_map_imu(0, 3));
+    double dy = pg.enu.y() - static_cast<double>(T_map_imu(1, 3));
+    double dz = pg.enu.z() - static_cast<double>(T_map_imu(2, 3));
+    double yaw = std::atan2(static_cast<double>(T_map_imu(1, 0)),
+                            static_cast<double>(T_map_imu(0, 0)));
+
+    // Positive along = GNSS ahead of SLAM; positive cross = GNSS to the left.
+    double along = dx * std::cos(yaw) + dy * std::sin(yaw);
+    double cross = -dx * std::sin(yaw) + dy * std::cos(yaw);
+
+    // Accumulate the running lag estimate over EVERY fix, independent of how
+    // often we print, so the mean is not thinned by the log throttle.
+    bool have_lag = pg.speed >= gnss_diff_min_speed_;
+    double implied_lag = 0.0;
+    if (have_lag) {
+      // GNSS trailing the SLAM pose (along < 0) means positive lag.
+      implied_lag = -along / pg.speed;
+      gnss_lag_sum_ += implied_lag;
+      ++gnss_lag_count_;
+    }
+
+    if (!do_print)
+      return;
+
+    if (have_lag) {
+      ROS_INFO("[GNSS-DIFF] t:%.3f along:%+7.2fm cross:%+6.2fm up:%+6.2fm "
+               "|2D|:%5.2fm v:%5.2fm/s implied_lag:%+6.3fs "
+               "(mean %+6.3fs over %ld)",
+               pg.time, along, cross, dz, std::hypot(dx, dy), pg.speed,
+               implied_lag, gnss_lag_sum_ / gnss_lag_count_, gnss_lag_count_);
+    } else {
+      ROS_INFO("[GNSS-DIFF] t:%.3f along:%+7.2fm cross:%+6.2fm up:%+6.2fm "
+               "|2D|:%5.2fm v:%5.2fm/s implied_lag:n/a (below %.1fm/s; "
+               "a lag collapses to 0 at standstill)",
+               pg.time, along, cross, dz, std::hypot(dx, dy), pg.speed,
+               gnss_diff_min_speed_);
+    }
   }
 
   void publishRangeRings(const ros::Time &stamp) {
