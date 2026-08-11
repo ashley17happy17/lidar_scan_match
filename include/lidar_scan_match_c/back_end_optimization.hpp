@@ -16,6 +16,9 @@
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/navigation/NavState.h>
 
+#include <deque>
+#include <vector>
+
 namespace lidar_scan_match_c {
 
 class BackEndOptimization {
@@ -34,7 +37,9 @@ public:
   // Integrate incoming IMU measurements continuously (100Hz+)
   void integrateImuMeasurement(const ImuMeasurement &imu, double dt);
 
-  // Add GPS factor
+  // Queue a GPS factor. The measurement is NOT bound to a node here: it is
+  // held until the graph contains a node at or after gps.timestamp, then bound
+  // to whichever node is nearest in time (see flushGpsQueue).
   void addGpsFactor(const GpsMeasurement &gps);
 
   // Add HD Map factor
@@ -63,6 +68,14 @@ public:
   gtsam::Pose3 getExtrinsic() const { return imu2Lidar_; }
 
 private:
+  // Bind queued GPS measurements to the graph node nearest in time. Called
+  // whenever a fix arrives or a new node is created.
+  void flushGpsQueue();
+
+  // Index of the node closest in time to t, or -1 if there are none.
+  // dt_out = t - key_times_[result] (positive means t is after the node).
+  int findNearestKeyByTime(double t, double &dt_out) const;
+
   gtsam::NonlinearFactorGraph gtsam_graph_;
   gtsam::Values initial_estimates_;
   gtsam::Values optimized_estimates_;
@@ -70,6 +83,17 @@ private:
   std::unique_ptr<gtsam::ISAM2> isam_;
   mutable std::recursive_mutex backend_mutex_;
   int key_index_;
+
+  // Timestamp of every graph node, so measurements can be associated by time
+  // rather than by "whatever key exists right now". key_times_[i] is the
+  // timestamp of X(i), hence key_times_.size() == key_index_ at all times.
+  std::vector<double> key_times_;
+
+  // GPS fixes awaiting a time-matched node.
+  std::deque<GpsMeasurement> gps_queue_;
+  int last_gps_bound_key_{-1};
+  double gps_assoc_max_dt_;
+  size_t gps_queue_max_;
 
   // IMU Preintegration
   boost::shared_ptr<gtsam::PreintegrationParams> p_;

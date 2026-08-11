@@ -1,6 +1,9 @@
 #include "lidar_scan_match_c/back_end_optimization.hpp"
 #include <gtsam/inference/Symbol.h>
 
+#include <algorithm>
+#include <cmath>
+
 using gtsam::symbol_shorthand::B; // Bias  (ax,ay,az,gx,gy,gz)
 using gtsam::symbol_shorthand::V; // Vel   (x,y,z)
 using gtsam::symbol_shorthand::X; // Pose3 (x,y,z,r,p,y)
@@ -20,6 +23,14 @@ BackEndOptimization::BackEndOptimization(ros::NodeHandle &nh) : key_index_(0) {
   nh.param<double>("imuAccBiasN", accBias, 1e-5);
   nh.param<double>("imuGyrBiasN", gyrBias, 1e-5);
   nh.param<double>("imuGravity", gravity, 9.81);
+
+  // Largest |node_time - gps_time| accepted when binding a GPS factor. Should
+  // be a little over half the node period (0.06s suits 10Hz nodes); anything
+  // farther is not time-synced and is refused rather than silently bound.
+  nh.param<double>("gps_assoc_max_dt", gps_assoc_max_dt_, 0.06);
+  int gps_queue_max = 200;
+  nh.param<int>("gps_queue_max", gps_queue_max, 200);
+  gps_queue_max_ = static_cast<size_t>(std::max(1, gps_queue_max));
 
   p_ = gtsam::PreintegrationParams::MakeSharedU(gravity);
   p_->accelerometerCovariance = gtsam::Matrix33::Identity() * pow(accNoise, 2);
@@ -218,7 +229,21 @@ void BackEndOptimization::addOdomFactor(double timestamp,
 
   // Reset IMU Integrator
   imu_preintegrator_->resetIntegrationAndSetBias(prev_bias_);
+
+  // Record this node's timestamp before advancing the index, so that
+  // key_times_[i] is the time of X(i) and key_times_.size() == key_index_.
+  if (!key_times_.empty() && timestamp <= key_times_.back()) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[BackEnd] Non-monotonic node timestamp (%.6f <= %.6f). "
+                      "Time-based measurement association will be degraded.",
+                      timestamp, key_times_.back());
+  }
+  key_times_.push_back(timestamp);
   key_index_++;
+
+  // A node now exists at this timestamp, so any queued GPS fix that this node
+  // brackets can be bound to its true nearest neighbour in time.
+  flushGpsQueue();
 }
 
 void BackEndOptimization::addZUPTFactor() {
@@ -239,32 +264,115 @@ void BackEndOptimization::addZUPTFactor() {
 
 void BackEndOptimization::addGpsFactor(const GpsMeasurement &gps) {
   std::lock_guard<std::recursive_mutex> lock(backend_mutex_);
-  if (key_index_ == 0)
-    return; // Graph not ready
 
-  // Create a GPS factor.
-  // CRITICAL FIX: The GPS measures the antenna position, not the IMU center!
-  // We must transform the GPS measurement back to the IMU center using the
-  // current heading/orientation.
-  gtsam::Point3 gps_point(gps.latitude, gps.longitude, gps.altitude);
-
-  gtsam::Pose3 current_imu_pose;
-  if (initial_estimates_.exists(X(key_index_ - 1))) {
-    current_imu_pose = initial_estimates_.at<gtsam::Pose3>(X(key_index_ - 1));
-  } else {
-    current_imu_pose = prev_state_.pose();
+  // Deliberately NOT bound to X(key_index_ - 1) here. This is called from the
+  // GPS drain loop, which runs before the current frame's node is created, so
+  // "latest key" is systematically one frame stale, and every fix drained in
+  // one cycle would pile onto that same node. Queue instead, and let
+  // flushGpsQueue() bind each fix to the node nearest its own timestamp.
+  if (gps_queue_.size() >= gps_queue_max_) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[BackEnd] GPS association queue full (%zu). Dropping the "
+                      "oldest fix - nodes are not being created.",
+                      gps_queue_.size());
+    gps_queue_.pop_front();
   }
+  gps_queue_.push_back(gps);
 
-  // gps_point = imu_position + R_world_imu * imu2Gps_.translation()
-  // imu_position = gps_point - R_world_imu * imu2Gps_.translation()
-  gtsam::Point3 imu_position =
-      gps_point - current_imu_pose.rotation() * imu2Gps_.translation();
+  // A fix that arrives late may already be bracketed by existing nodes.
+  flushGpsQueue();
+}
 
-  gtsam::noiseModel::Diagonal::shared_ptr gps_noise =
-      gtsam::noiseModel::Diagonal::Variances(gps.covariance_diag);
+int BackEndOptimization::findNearestKeyByTime(double t, double &dt_out) const {
+  dt_out = 0.0;
+  if (key_times_.empty())
+    return -1;
 
-  gtsam::GPSFactor gps_factor(X(key_index_ - 1), imu_position, gps_noise);
-  gtsam_graph_.add(gps_factor);
+  // key_times_ is monotonically increasing, so binary search applies.
+  auto it = std::lower_bound(key_times_.begin(), key_times_.end(), t);
+  int best;
+  if (it == key_times_.begin()) {
+    best = 0;
+  } else if (it == key_times_.end()) {
+    best = static_cast<int>(key_times_.size()) - 1;
+  } else {
+    int hi = static_cast<int>(it - key_times_.begin());
+    int lo = hi - 1;
+    best = ((t - key_times_[lo]) <= (key_times_[hi] - t)) ? lo : hi;
+  }
+  dt_out = t - key_times_[best];
+  return best;
+}
+
+void BackEndOptimization::flushGpsQueue() {
+  std::lock_guard<std::recursive_mutex> lock(backend_mutex_);
+  if (key_index_ == 0 || key_times_.empty())
+    return; // Graph not ready; fixes stay queued.
+
+  while (!gps_queue_.empty()) {
+    const GpsMeasurement gps = gps_queue_.front();
+
+    // Wait until a node exists at or after this fix. Binding earlier risks
+    // choosing the node before it when the one after it is closer in time.
+    if (gps.timestamp > key_times_.back())
+      break;
+
+    double dt = 0.0;
+    int key = findNearestKeyByTime(gps.timestamp, dt);
+    gps_queue_.pop_front();
+    if (key < 0)
+      continue;
+
+    // Refuse to bind a fix that no node is actually contemporaneous with,
+    // rather than attaching it to a node it does not describe.
+    if (std::abs(dt) > gps_assoc_max_dt_) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[BackEnd] GPS fix t=%.3f rejected: nearest node %d is "
+                        "%+.4fs away (limit %.3fs). Not time-synced.",
+                        gps.timestamp, key, dt, gps_assoc_max_dt_);
+      continue;
+    }
+
+    // One GPS factor per node. Nearest-key is monotonic in time and the queue
+    // is processed in time order, so a non-increasing key means a second fix
+    // landed on a node that already has one (or arrived out of order).
+    if (key <= last_gps_bound_key_) {
+      ROS_WARN_THROTTLE(1.0,
+                        "[BackEnd] Node %d already carries a GPS factor; "
+                        "skipping fix t=%.3f (dt %+.4fs) to avoid "
+                        "double-weighting a single node.",
+                        key, gps.timestamp, dt);
+      continue;
+    }
+
+    // The GPS measures the antenna, not the IMU centre, so de-lever-arm using
+    // the orientation of the MATCHED node - not the latest one.
+    gtsam::Pose3 node_pose;
+    if (optimized_estimates_.exists(X(key))) {
+      node_pose = optimized_estimates_.at<gtsam::Pose3>(X(key));
+    } else if (initial_estimates_.exists(X(key))) {
+      node_pose = initial_estimates_.at<gtsam::Pose3>(X(key));
+    } else {
+      node_pose = prev_state_.pose();
+    }
+
+    // gps_point = imu_position + R_world_imu * imu2Gps_.translation()
+    // imu_position = gps_point - R_world_imu * imu2Gps_.translation()
+    gtsam::Point3 gps_point(gps.latitude, gps.longitude, gps.altitude);
+    gtsam::Point3 imu_position =
+        gps_point - node_pose.rotation() * imu2Gps_.translation();
+
+    gtsam::noiseModel::Diagonal::shared_ptr gps_noise =
+        gtsam::noiseModel::Diagonal::Variances(gps.covariance_diag);
+    gtsam_graph_.add(gtsam::GPSFactor(X(key), imu_position, gps_noise));
+    last_gps_bound_key_ = key;
+
+    ROS_INFO_THROTTLE(1.0,
+                      "[BackEnd] GPS bound to node %d (node_t=%.3f gps_t=%.3f "
+                      "dt=%+.4fs, %d node(s) behind latest).",
+                      key, key_times_[key], gps.timestamp, dt,
+                      key_index_ - 1 - key);
+  }
 }
 
 void BackEndOptimization::addHDMapFactor(
