@@ -226,7 +226,7 @@ private:
                 filename.c_str());
       return;
     }
-    f << "time_ms,lat,lon,h,twd97x,twd97y,twd97z,roll_rad,pitch_rad,yaw_rad,source\n";
+    f << "time,lat,lon,h,twd97x,twd97y,twd97z,roll_rad,pitch_rad,yaw_rad,source\n";
     for (const auto &p : recorded_trajectory_) {
       // Timestamp in integer milliseconds (sub-ms digits truncated).
       long long time_ms = static_cast<long long>(std::round(p.time * 1000.0));

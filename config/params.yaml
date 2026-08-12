@@ -63,6 +63,6 @@ no_map_use_gps_only: false              # bool: outside HD Map, skip lidar scan-
 no_map_gps_fixed_std: 2.0               # unit: meter (Assumed GPS 2D std-dev used when no_map_use_gps_only is true, ignores reported covariance)
 
 # Output
-out_trajectory_path: "/root/catkin_ws/data/data_collection/output/20260714_b_traj/lidar_traj.csv"
+out_trajectory_path: "/root/catkin_ws/data/data_collection/output/20260714_b_traj/ego_traj.csv"
 out_save: true                          # bool: whether to save CSV on exit
 out_hz: 10                              # unit: Hz (Trajectory recording frequency)
