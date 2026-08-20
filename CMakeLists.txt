@@ -33,15 +33,10 @@ find_package(Eigen3 REQUIRED)
 # Find PDAL
 find_package(PDAL REQUIRED)
 
-# Fetch small_gicp
-include(FetchContent)
-FetchContent_Declare(small_gicp
-  GIT_REPOSITORY https://github.com/koide3/small_gicp.git
-  GIT_TAG master
-)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(BUILD_WITH_OPENMP ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(small_gicp)
+# small_gicp 由 third_party/lidar_utils_lib 提供（見下方 add_subdirectory），
+# 已 vendor 進該函式庫內，建置不需要網路，版本也不會隨 upstream master 漂移。
+# 注意：原本這裡的 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE) 會強制整個
+# 專案改成靜態連結，一併移除；CMake 未設定此變數時預設就是靜態。
 
 catkin_package(
   INCLUDE_DIRS include
