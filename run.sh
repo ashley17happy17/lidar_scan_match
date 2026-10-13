@@ -14,6 +14,11 @@ cd /root/catkin_ws
 catkin_make
 source devel/setup.bash
 
+# Ensure the current hostname is resolvable in /etc/hosts
+if ! grep -q "$(hostname)" /etc/hosts 2>/dev/null; then
+    echo "127.0.0.1 $(hostname)" >> /etc/hosts 2>/dev/null || true
+fi
+
 export ROS_HOSTNAME=localhost
 export ROS_MASTER_URI=http://localhost:11311
 # # Ensure DISPLAY is correct (native Linux typically uses :0)
@@ -23,6 +28,5 @@ export ROS_MASTER_URI=http://localhost:11311
 
 # echo "Environment: DISPLAY=$DISPLAY, LIBGL_SOFTWARE=$LIBGL_ALWAYS_SOFTWARE"
 
-# # Ensure we start with a clean slate
-# # Launch using roslaunch which will now use the injected <env> tags
-roslaunch lidar_scan_match_c run.launch
+# Ensure we start with a clean slate
+roslaunch lidar_scan_match_c run.launch "$@"

@@ -8,6 +8,7 @@ add_compile_options(-std=c++17 -O3 -Wall)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
+  rosbag
   std_msgs
   sensor_msgs
   nav_msgs
@@ -41,7 +42,7 @@ find_package(PDAL REQUIRED)
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES ${PROJECT_NAME} 
-  CATKIN_DEPENDS roscpp rospy std_msgs sensor_msgs nav_msgs geometry_msgs pcl_ros pcl_conversions cv_bridge tf2 tf2_ros tf2_geometry_msgs
+  CATKIN_DEPENDS roscpp rospy rosbag std_msgs sensor_msgs nav_msgs geometry_msgs pcl_ros pcl_conversions cv_bridge tf2 tf2_ros tf2_geometry_msgs
   DEPENDS PCL Ceres GTSAM OpenCV Eigen3
 )
 
