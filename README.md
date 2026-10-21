@@ -129,7 +129,30 @@ icp_max_iterations: 100                 # unit: count
 hd_map_match_interval: 2                # unit: Hz (target frequency for Scan-to-HDMap match)
 
 # Output
-out_trajectory_path: "/root/catkin_ws/data/data_collection/output/tmp/ego_traj_map.csv"
+out_trajectory_path: "/root/catkin_ws/src/lidar_scan_match_c/output/2026092302/ego_traj.csv"
 out_save: true                          # bool: whether to save CSV on exit
-out_hz: 10                              # unit: Hz (Trajectory recording frequency)
+out_hz: 10                              # unit: Hz (Trajectory recording frequency, locked to LiDAR timestamps)
+
+# Trajectory Output Reference Center (Lever Arm & Boresight relative to IMU)
+# Note: The output trajectory center is currently at the IMU center by default.
+# Users can shift/rotate the trajectory reference center to another point (e.g. rear axle center, base_link) using:
+#   out_la: Lever arm translation [x, y, z] in meters (relative to IMU body frame: X-Front, Y-Left, Z-Up)
+#   out_bs: Boresight angular offset [roll, pitch, yaw] in radians (relative to IMU body frame)
+out_la: [0.0, 0.0, 0.0]                 # unit: meter [x, y, z] (Lever arm offset from IMU center)
+out_bs: [0.0, 0.0, 0.0]                 # unit: rad [roll, pitch, yaw] (Boresight rotation offset from IMU center)
 ```
+
+---
+
+## Trajectory Output Format (`ego_traj.csv`)
+
+The trajectory CSV contains the following columns:
+```csv
+time,lat,lon,h,twd97x,twd97y,twd97z,roll_rad,pitch_rad,yaw_rad,source
+```
+
+- **`time`**: Integer milliseconds (`ms`) based directly on the **LiDAR data timestamp** (`header.stamp`). Each row corresponds to a LiDAR scan match with zero interpolation delay.
+- **`lat, lon, h`**: WGS-84 geographic coordinates.
+- **`twd97x, twd97y, twd97z`**: Taiwan TWD97 projected coordinates in meters.
+- **`roll_rad, pitch_rad, yaw_rad`**: Vehicle body orientation in radians ($X=\text{Front}, Y=\text{Left}, Z=\text{Up}$).
+- **Reference Center**: By default, the trajectory position and attitude correspond to the **IMU center**. Adjust `out_la` and `out_bs` in `config/params.yaml` to shift the reference point to any vehicle frame (e.g., rear axle center or vehicle center of gravity).

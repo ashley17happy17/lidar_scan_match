@@ -1,17 +1,17 @@
 # Lidar Scan Match ROS Parameters
 
 # Bag Playback Configuration
-bag_file: "/root/catkin_ws/data/data_collection/20260918_rec01/merged_sep.bag"                            # string: path to .bag file (leave "" for live subscriber mode)
-bag_start_time: 150.0                     # unit: sec (start offset from bag beginning, e.g. 30.0)
-bag_duration: -1.0                       # unit: sec (duration to process, -1.0 for entire bag)
+bag_file: "/root/catkin_ws/data/data_collection/20260923_rec02/merged.bag"                            # string: path to .bag file (leave "" for live subscriber mode)
+bag_start_time: 80.0                     # unit: sec (start offset from bag beginning, e.g. 30.0)
+bag_duration: 320.0                       # unit: sec (duration to process, -1.0 for entire bag)
 exit_on_finish: false                   # bool: automatically terminate ROS node when bag finishes
 
 lidar_topic: "/points_raw" #"/ouster/points"   #       # sensor_msgs/PointCloud2
-gps_topic: "/gps/fix" #"/ublox_gps_node/fix" #        # sensor_msgs/NavSatFix
+gps_topic: "/adr" #"/ublox_gps_node/fix" #        # sensor_msgs/NavSatFix
 imu_topic: "/imu_combined"              # sensor_msgs/Imu
 
 # HD Map Settings
-hd_map_directory: "/root/catkin_ws/data/BaoGao_HDmap_pcd/" #/PH3_HDmap/map_tiles/" #
+hd_map_directory: "/root/catkin_ws/data/PH3_HDmap/map_tiles/" #/BaoGao_HDmap_pcd/" #
 map_tile_size: 50.0                    # unit: meter
 
 # Extrinsics (IMU to Lidar)
@@ -43,7 +43,7 @@ icp_max_iterations: 100                 # unit: count
 icp_rotation_epsilon: 5e-3              # unit: rad
 icp_transformation_epsilon: 1e-2        # unit: meter
 icp_euclidean_fitness_epsilon: 1e-4     # unit: meter
-icp_max_dist_sq: 36.0                    # unit: meter^2 (Matching search radius squared)
+icp_max_dist_sq: 25.0                    # unit: meter^2 (Matching search radius squared)
 icp_num_threads: 15                     # unit: count
 lidar_rps: 10                           # unit: Hz (Lidar sensor frequency)
 hd_map_match_interval: 2                # unit: Hz (Target frequency for Scan-to-HDMap match)
@@ -67,13 +67,19 @@ gps_fallback_min_failures: 3            # unit: count (Inject loose-covariance G
 gps_std_thres_no_map: 5.0               # unit: meter (Trust standard-precision GPS over local-map ICP whenever outside HD Map)
 no_map_use_gps_only: true              # bool: outside HD Map, skip lidar scan-to-local-map entirely and trust GPS/IMU directly
 no_map_gps_fixed_std: 2.0               # unit: meter (Assumed GPS 2D std-dev used when no_map_use_gps_only is true, ignores reported covariance)
-
 # DEBUG (test only): place raw lidar in world by GNSS position + IMU/EOP
 # orientation only (no scan matching). Publishes /lidar_scan_match_c/gnss_eop_cloud,
 # /gnss_eop_path, and /gnss_eop_range_rings. Set false (or delete) to restore.
 debug_gnss_eop: false
 
 # Output
-out_trajectory_path: "/root/catkin_ws/data/data_collection/output/tmp/ego_traj_map.csv"
+out_trajectory_path: "/root/catkin_ws/src/lidar_scan_match_c/output/2026092302/ego_traj.csv"
 out_save: true                          # bool: whether to save CSV on exit
 out_hz: 10                              # unit: Hz (Trajectory recording frequency)
+# Trajectory Output Reference Center (Lever Arm & Boresight relative to IMU)
+# Note: The output trajectory center is currently at the IMU center by default.
+# Users can shift/rotate the trajectory reference center to another point (e.g. rear axle center, base_link) using:
+#   out_la: Lever arm translation [x, y, z] in meters (relative to IMU body frame: X-Front, Y-Left, Z-Up)
+#   out_bs: Boresight angular offset [roll, pitch, yaw] in radians (relative to IMU body frame)
+out_la: [0.0, 0.0, 0.0]                 # unit: meter [x, y, z] (Lever arm offset from IMU center)
+out_bs: [0.0, 0.0, 0.0]                 # unit: rad [roll, pitch, yaw] (Boresight rotation offset from IMU center)

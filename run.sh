@@ -20,7 +20,7 @@ if ! grep -q "$(hostname)" /etc/hosts 2>/dev/null; then
 fi
 
 export ROS_HOSTNAME=localhost
-export ROS_MASTER_URI=http://localhost:11311
+export ROS_MASTER_URI=http://localhost:11312
 # # Ensure DISPLAY is correct (native Linux typically uses :0)
 # if [ -z "$DISPLAY" ]; then
 #     export DISPLAY=:0

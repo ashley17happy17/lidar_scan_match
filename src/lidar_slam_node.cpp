@@ -65,6 +65,32 @@ public:
     nh_.param<double>("out_hz", out_hz_, 10.0);
     nh_.param<double>("gnss_diff_min_speed", gnss_diff_min_speed_, 2.0);
 
+    // Trajectory Output Reference Center (Lever Arm & Boresight relative to IMU)
+    std::vector<double> out_la_vec, out_bs_vec;
+    nh_.getParam("out_la", out_la_vec);
+    nh_.getParam("out_bs", out_bs_vec);
+    Eigen::Vector3f out_la = Eigen::Vector3f::Zero();
+    Eigen::Matrix3f out_bs_rot = Eigen::Matrix3f::Identity();
+    if (out_la_vec.size() == 3) {
+      out_la = Eigen::Vector3f(out_la_vec[0], out_la_vec[1], out_la_vec[2]);
+    }
+    if (out_bs_vec.size() == 3) {
+      // out_bs: roll, pitch, yaw (rad)
+      Eigen::AngleAxisf roll(out_bs_vec[0], Eigen::Vector3f::UnitX());
+      Eigen::AngleAxisf pitch(out_bs_vec[1], Eigen::Vector3f::UnitY());
+      Eigen::AngleAxisf yaw(out_bs_vec[2], Eigen::Vector3f::UnitZ());
+      out_bs_rot = (yaw * pitch * roll).toRotationMatrix();
+    }
+    T_imu_out_ = Eigen::Matrix4f::Identity();
+    T_imu_out_.block<3, 3>(0, 0) = out_bs_rot;
+    T_imu_out_.block<3, 1>(0, 3) = out_la;
+    if (out_la.norm() > 1e-4 || !out_bs_rot.isIdentity(1e-4)) {
+      ROS_INFO("[Output] Trajectory center shifted from IMU by LA: [%.3f, %.3f, %.3f]m",
+               out_la.x(), out_la.y(), out_la.z());
+    } else {
+      ROS_INFO("[Output] Trajectory center is at default IMU center.");
+    }
+
     // Loop Closure
     nh_.param<bool>("loop_closure_enabled", loop_closure_enabled_, true);
     nh_.param<double>("loop_closure_search_radius", loop_closure_search_radius_,
@@ -215,12 +241,13 @@ private:
     TrajectoryPoint tp;
     Eigen::Matrix4f T_imu_lidar = backend_->getExtrinsic().matrix().cast<float>();
     Eigen::Matrix4f T_map_imu = pose * T_imu_lidar.inverse();
-    Eigen::Quaternionf q_veh(T_map_imu.block<3, 3>(0, 0));
+    Eigen::Matrix4f T_map_out = T_map_imu * T_imu_out_;
+    Eigen::Quaternionf q_veh(T_map_out.block<3, 3>(0, 0));
 
     tp.time = t;
-    tp.twdx = T_map_imu(0, 3) + map_origin_twd97_.x();
-    tp.twdy = T_map_imu(1, 3) + map_origin_twd97_.y();
-    tp.twdz = T_map_imu(2, 3) + map_origin_twd97_.z();
+    tp.twdx = T_map_out(0, 3) + map_origin_twd97_.x();
+    tp.twdy = T_map_out(1, 3) + map_origin_twd97_.y();
+    tp.twdz = T_map_out(2, 3) + map_origin_twd97_.z();
 
     // Convert Map Frame (ENU) to Lat/Lon/H
     gps_translator_internal_.GetWGS84(tp.twdx, tp.twdy, tp.twdz, tp.lat, tp.lon,
@@ -239,7 +266,7 @@ private:
 
     // Heading (Yaw) using the vehicle's forward vector
     Eigen::Vector3f veh_forward_in_map =
-        T_map_imu.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
+        T_map_out.block<3, 3>(0, 0) * Eigen::Vector3f::UnitX();
     tp.yaw = std::atan2(veh_forward_in_map.x(), veh_forward_in_map.y());
     tp.source = "MAP";
     return tp;
@@ -1125,20 +1152,20 @@ private:
               double lateral_jump = std::abs(delta_t_body.y());
 
               if (hd_fitness < threshold && lateral_jump < 10.0) {
-                // If HD Map pulled the pose by more than 0.5m, the Local Map
-                // is internally distorted (ghosted). Clear it!
-                double correction_jump = (rescue_pose.block<3, 1>(0, 3) -
-                                          current_pose_.block<3, 1>(0, 3))
-                                             .norm();
-                if (correction_jump > 0.5) {
-                  ROS_WARN_THROTTLE(
-                      1.0,
-                      "[WARN] Local Map: HD Map correction %.2fm is "
-                      "large. Clearing distorted Local Map!",
-                      correction_jump);
-                  frontend_->clearLocalMap();
-                  local_map_->clear();
-                }
+                  // If HD Map pulled the pose by more than 0.5m, the Local Map
+                  // is internally distorted (ghosted). Clear it!
+                  double correction_jump = (rescue_pose.block<3, 1>(0, 3) -
+                                            current_pose_.block<3, 1>(0, 3))
+                                               .norm();
+                  if (correction_jump > 0.5) {
+                    ROS_WARN_THROTTLE(
+                        1.0,
+                        "[WARN] Local Map: HD Map correction %.2fm is "
+                        "large. Clearing distorted Local Map!",
+                        correction_jump);
+                    frontend_->clearLocalMap();
+                    local_map_->clear();
+                  }
 
                 current_pose_ = rescue_pose; // 以 HD Map 全域結果為最終姿態
                 hd_map_matched_this_frame = true;
@@ -1159,8 +1186,8 @@ private:
             }
           }
 
-          should_skip_frame =
-              !hd_map_matched_this_frame && !local_match_success;
+            should_skip_frame =
+                !hd_map_matched_this_frame && !local_match_success;
 
         } else {
           // --- 狀態 B：沒有 HD Map ---
@@ -1540,6 +1567,7 @@ private:
   std::string out_trajectory_path_;
   bool out_save_;
   double out_hz_;
+  Eigen::Matrix4f T_imu_out_{Eigen::Matrix4f::Identity()};
   double tile_size;
   double max_trans_jump_;
   double max_rot_jump_;
@@ -1808,9 +1836,19 @@ private:
     // 4.8 Publish Range Rings (5m & 10m)
     publishRangeRings(rts);
 
-    // 5. Record Trajectory Points at each GPS timestamp (pose interpolated to
-    // the exact GPS instant so time and pose stay consistent), rate-limited
-    // to out_hz_. GPS timestamps this cycle fall in (traj_prev_time_, ts].
+    // 5. Record Trajectory Points at each LiDAR frame timestamp (ts),
+    // rate-limited to out_hz_. The trajectory output strictly follows
+    // the incoming LiDAR data rate and timestamps.
+    if (has_map_origin_) {
+      bool record = !(last_record_time_ >= 0 &&
+                      ts - last_record_time_ < (0.95 / out_hz_));
+      if (record) {
+        recorded_trajectory_.push_back(poseToTrajectoryPoint(pose, ts));
+        last_record_time_ = ts;
+      }
+    }
+
+    // Measure GNSS/SLAM discrepancy against incoming GPS fixes
     if (has_map_origin_ && traj_prev_time_ >= 0.0 && ts > traj_prev_time_) {
       double bracket = ts - traj_prev_time_;
       for (const auto &pg : pending_gps_) {
@@ -1822,20 +1860,12 @@ private:
         Eigen::Matrix4f interp_pose =
             interpolatePose(traj_prev_pose_, pose, frac);
 
-        bool record = !(last_record_time_ >= 0 &&
-                        pg.time - last_record_time_ < (0.95 / out_hz_));
-
-        // Measure the GNSS/SLAM discrepancy on every fix, but only print it for
-        // the fixes that get recorded, so the log lines correspond 1:1 with the
-        // rows of the output trajectory and both run at out_hz_.
-        logGnssTrackDiff(pg, interp_pose, record);
-
-        if (!record)
-          continue;
-
-        recorded_trajectory_.push_back(
-            poseToTrajectoryPoint(interp_pose, pg.time));
-        last_record_time_ = pg.time;
+        static double last_gnss_print_time = -1.0;
+        bool do_print = (last_gnss_print_time < 0 ||
+                         pg.time - last_gnss_print_time >= 1.0);
+        logGnssTrackDiff(pg, interp_pose, do_print);
+        if (do_print)
+          last_gnss_print_time = pg.time;
       }
     }
 
